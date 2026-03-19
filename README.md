@@ -43,7 +43,7 @@
 
 ## PDF 기능
 
-- `faithful`, `semantic`, `hybrid` HTML 모드
+- `faithful`, `semantic`, `hybrid`, `reconstructed` HTML 모드
 - direct Markdown 생성
 - borderless table inference, multi-line cell merge, adjacent table merge
 - page layout classification: `text`, `table`, `diagram`, `mixed`
@@ -95,10 +95,22 @@ Markdown만:
 pardoc report.pdf --format markdown
 ```
 
+기본 PDF HTML:
+
+```bash
+pardoc report.pdf
+```
+
 faithful PDF HTML:
 
 ```bash
 pardoc report.pdf --pdf-mode faithful
+```
+
+reconstructed PDF HTML:
+
+```bash
+pardoc report.pdf --pdf-mode reconstructed --format html
 ```
 
 hybrid PDF HTML + Markdown:
@@ -151,6 +163,27 @@ pardoc report.pdf --pdf-mode hybrid --debug-overlays --format html
 - `report.pdf --format markdown` -> `output/report.md`
 - `report.pdf --format all` -> `output/report.txt`, `output/report.html`, `output/report.md`
 - `report.pdf --json-output` -> 기존 출력 + `output/report.json`
+
+## PDF 출력 모드 가이드
+
+- `faithful`
+  - 원본 페이지 이미지를 유지하는 HTML입니다.
+  - debug overlay 확인에 가장 적합합니다.
+- `semantic`
+  - 텍스트, 표, diagram summary 위주의 구조화 HTML입니다.
+- `hybrid`
+  - faithful view와 structured content를 함께 제공합니다.
+- `reconstructed`
+  - 기본값입니다.
+  - 배경 페이지 이미지를 쓰지 않고, 추출한 block/table을 HTML/CSS만으로 다시 배치합니다.
+  - `article`, `main`, `section`, `form`, `fieldset` 같은 DOM 구조를 우선해서 원본과 유사한 문서 구조를 재생성합니다.
+  - 원본과 유사한 읽기 흐름과 섹션감을 목표로 하지만, complex diagram/page art는 완전 복제하지 않습니다.
+
+## HTML / Markdown 품질 기준
+
+- HTML은 기본적으로 `reconstructed` 모드에서 원본과 유사한 DOM 구조, 블록 배치, 표 구조 재생성을 목표로 합니다.
+- Markdown은 표준 문법 한계 때문에 레이아웃 복제보다는 읽기 순서와 구조 보존에 초점을 둡니다.
+- 따라서 HTML은 이미지 배치보다 DOM 구조 재생성을 우선합니다.
 
 ## PDF 상태 / 분석 출력
 

@@ -97,9 +97,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--pdf-mode",
-        choices=["faithful", "semantic", "hybrid"],
-        default="hybrid",
-        help="PDF HTML mode: faithful keeps original page look, semantic keeps structured HTML, hybrid includes both",
+        choices=["faithful", "semantic", "hybrid", "reconstructed"],
+        default="reconstructed",
+        help="PDF HTML mode: reconstructed is the default DOM-first mode, faithful keeps original page look, semantic keeps structured HTML, hybrid includes both",
     )
     parser.add_argument(
         "--ocr-mode",

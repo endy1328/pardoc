@@ -21,7 +21,7 @@ class ConversionError(RuntimeError):
     """Raised when a file cannot be converted."""
 
 
-CACHE_SCHEMA_VERSION = 8
+CACHE_SCHEMA_VERSION = 9
 
 
 @dataclass(slots=True)
@@ -35,7 +35,7 @@ class ConversionResult:
 
 @dataclass(slots=True)
 class ConversionOptions:
-    pdf_mode: str = "hybrid"
+    pdf_mode: str = "reconstructed"
     ocr_mode: str = "auto"
     ocr_dpi: int = 200
     ocr_workers: int = 1
@@ -440,6 +440,28 @@ def _build_html_document(title: str, body: str, warnings: list[str] | None = Non
         "    .pdf-debug-badge { position: absolute; top: 0.5rem; right: 0.5rem; padding: 0.2rem 0.45rem; font: 600 12px/1.2 sans-serif; color: #fff; background: rgba(217, 119, 6, 0.9); border-radius: 999px; }\n"
         "    .pdf-preview { margin: 1rem 0 1.5rem; border: 1px solid #d1d5db; background: #f8fafc; padding: 0.75rem; }\n"
         "    .pdf-preview img { display: block; width: 100%; height: auto; }\n"
+        "    .pdf-reconstructed { margin: 1rem 0 1.5rem; border: 1px solid #d1d5db; background: #fff; padding: 1rem; }\n"
+        "    .pdf-reconstructed-page { display: flex; flex-direction: column; gap: 0.75rem; margin: 0; }\n"
+        "    .pdf-reconstructed-page.pdf-reconstructed-form { gap: 0.9rem; }\n"
+        "    .pdf-reconstructed-row { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: 1rem; align-items: start; margin: 0; padding: 0; border: 0; min-inline-size: 0; }\n"
+        "    .pdf-reconstructed-row.columns-2 { column-gap: 1.5rem; }\n"
+        "    .pdf-reconstructed-row.columns-3 { column-gap: 1.25rem; }\n"
+        "    .pdf-form-title { margin: 0 0 0.4rem; text-align: center; }\n"
+        "    .pdf-form-title h1 { margin: 0; font-size: 2rem; letter-spacing: 0.08em; }\n"
+        "    .pdf-form-overview, .pdf-form-section { margin: 0; }\n"
+        "    .pdf-form-section > header { display: flex; align-items: flex-end; justify-content: flex-start; margin: 0 0 0.35rem; }\n"
+        "    .pdf-form-section > header h2 { margin: 0; font-size: 1.1rem; letter-spacing: 0.04em; }\n"
+        "    .pdf-form-section table { margin-top: 0; }\n"
+        "    .pdf-reconstructed-summary { margin-bottom: 0.85rem; }\n"
+        "    .pdf-reconstructed-summary p { margin: 0; color: #64748b; font-size: 0.92rem; }\n"
+        "    .pdf-reconstructed-item { min-width: 0; }\n"
+        "    .pdf-reconstructed-item.centered { text-align: center; }\n"
+        "    .pdf-reconstructed-item.full-width > *:first-child { margin-top: 0; }\n"
+        "    .pdf-reconstructed-item.callout { padding: 0.75rem 0.9rem; border: 1px solid #cbd5e1; border-radius: 0.5rem; background: #f8fafc; }\n"
+        "    .pdf-reconstructed-item.narrow { font-size: 0.96rem; }\n"
+        "    .pdf-reconstructed-item.table { overflow-x: auto; }\n"
+        "    .pdf-reconstructed-item.form-field { padding: 0.15rem 0; }\n"
+        "    .pdf-reconstructed-item.form-field p { margin-bottom: 0.25rem; }\n"
         "    .pdf-semantic { margin-top: 1rem; }\n"
         "    .pdf-semantic details { margin-top: 1rem; }\n"
         "    .pdf-semantic summary { cursor: pointer; color: #334155; font-weight: 600; }\n"
@@ -747,6 +769,15 @@ def _extract_pymupdf_page(
     markdown_body = "\n\n".join(part for part in markdown_parts if part).strip()
     if diagram["boxes"] or diagram.get("edges"):
         markdown_body = "\n\n".join(part for part in [markdown_body, _render_diagram_summary_markdown(diagram)] if part).strip()
+    reconstructed_html = _render_pdf_page_reconstructed(
+        page,
+        blocks,
+        tables,
+        table_bboxes,
+        body if body != "<p></p>" else "",
+        ocr_payload,
+        diagram,
+    )
     preview_html = _render_pdf_page_preview(
         page,
         source_path,
@@ -778,6 +809,9 @@ def _extract_pymupdf_page(
     page_html = faithful_html or preview_html
     if options.pdf_mode == "semantic":
         page_html = ""
+    elif options.pdf_mode == "reconstructed":
+        page_html = reconstructed_html
+        semantic_html = ""
     elif options.pdf_mode == "faithful":
         semantic_html = ""
     page_meta = (
@@ -2507,6 +2541,119 @@ def _extract_ocr_words(ocr_data: dict[str, list[Any]], *, min_confidence: float 
     return words
 
 
+def _build_structured_ocr_text(
+    words: list[dict[str, Any]],
+    *,
+    image_width: int,
+    image_height: int,
+    layout_hint: str,
+) -> str:
+    if not words or image_width <= 0 or image_height <= 0:
+        return ""
+
+    prepared: list[dict[str, Any]] = []
+    heights: list[float] = []
+    for word in words:
+        if not isinstance(word, dict):
+            continue
+        text = str(word.get("text", "")).strip()
+        bbox = word.get("bbox", [])
+        if not text or not isinstance(bbox, list) or len(bbox) != 4:
+            continue
+        x0, y0, x1, y1 = [float(value) for value in bbox]
+        if x1 <= x0 or y1 <= y0:
+            continue
+        heights.append(y1 - y0)
+        prepared.append({"text": text, "bbox": [x0, y0, x1, y1]})
+    if not prepared:
+        return ""
+
+    median_height = sorted(heights)[len(heights) // 2] if heights else 12.0
+    line_tolerance = max(10.0, median_height * 0.8)
+    prepared.sort(key=lambda item: ((item["bbox"][1] + item["bbox"][3]) / 2, item["bbox"][0]))
+
+    lines: list[dict[str, Any]] = []
+    for word in prepared:
+        center_y = (word["bbox"][1] + word["bbox"][3]) / 2
+        placed = False
+        for line in lines:
+            if abs(center_y - float(line["center_y"])) <= line_tolerance:
+                line["words"].append(word)
+                line["center_y"] = (
+                    sum((entry["bbox"][1] + entry["bbox"][3]) / 2 for entry in line["words"]) / len(line["words"])
+                )
+                placed = True
+                break
+        if not placed:
+            lines.append({"center_y": center_y, "words": [word]})
+
+    normalized_lines: list[dict[str, Any]] = []
+    for line in lines:
+        line_words = sorted(line["words"], key=lambda entry: entry["bbox"][0])
+        segments: list[list[dict[str, Any]]] = [[line_words[0]]]
+        for word in line_words[1:]:
+            previous = segments[-1][-1]
+            gap = float(word["bbox"][0]) - float(previous["bbox"][2])
+            if gap > max(median_height * 2.1, image_width * 0.045):
+                segments.append([word])
+            else:
+                segments[-1].append(word)
+        text = "  ".join(" ".join(entry["text"] for entry in segment).strip() for segment in segments if segment).strip()
+        if not text:
+            continue
+        x0 = min(entry["bbox"][0] for entry in line_words)
+        x1 = max(entry["bbox"][2] for entry in line_words)
+        y0 = min(entry["bbox"][1] for entry in line_words)
+        y1 = max(entry["bbox"][3] for entry in line_words)
+        normalized_lines.append(
+            {
+                "text": text,
+                "x0": x0,
+                "x1": x1,
+                "y0": y0,
+                "y1": y1,
+                "center_x": (x0 + x1) / 2,
+                "center_y": (y0 + y1) / 2,
+                "width": x1 - x0,
+            }
+        )
+    if not normalized_lines:
+        return ""
+
+    column_lines = [line for line in normalized_lines if line["width"] <= image_width * 0.7]
+    column_centers = _cluster_reconstructed_positions(
+        [float(line["center_x"]) for line in column_lines],
+        tolerance=image_width * 0.18,
+    )
+    if len(column_centers) > 3:
+        column_centers = column_centers[:3]
+
+    if layout_hint not in {"diagram", "mixed"}:
+        column_centers = []
+
+    for line in normalized_lines:
+        if not column_centers:
+            line["column"] = 0
+        else:
+            line["column"] = min(range(len(column_centers)), key=lambda idx: abs(column_centers[idx] - float(line["center_x"])))
+
+    ordered = sorted(normalized_lines, key=lambda line: (int(line["column"]), float(line["y0"]), float(line["x0"])))
+    parts: list[str] = []
+    previous_by_column: dict[int, float] = {}
+    last_column: int | None = None
+    for line in ordered:
+        column = int(line["column"])
+        if last_column is not None and column != last_column:
+            parts.append("")
+        gap = float(line["y0"]) - float(previous_by_column.get(column, line["y0"]))
+        if column in previous_by_column and gap > max(median_height * 1.9, image_height * 0.028):
+            parts.append("")
+        parts.append(str(line["text"]))
+        previous_by_column[column] = float(line["y1"])
+        last_column = column
+    return _clean_pdf_text("\n".join(parts))
+
+
 def _preprocess_ocr_image(image: Any, profile: dict[str, Any]) -> Any:
     from PIL import ImageOps
 
@@ -2567,17 +2714,24 @@ def _extract_ocr_from_raster(task: tuple[int, bytes, bool, int, str]) -> tuple[i
                     }
                 )
                 if best_payload is None or score > float(best_payload["score"]):
+                    words = _extract_ocr_words(
+                        data,
+                        min_confidence=float(profile.get("word_confidence_floor", 40.0) or 40.0),
+                    )
+                    structured_text = _build_structured_ocr_text(
+                        words,
+                        image_width=width,
+                        image_height=height,
+                        layout_hint=layout_hint,
+                    )
                     best_summary = summary
                     best_payload = {
                         "score": score,
-                        "text": text,
+                        "text": structured_text or text,
                         "overlay": _render_ocr_overlay(data, width, height),
                         "confidence_summary": summary,
                         "profile": profile["key"],
-                        "words": _extract_ocr_words(
-                            data,
-                            min_confidence=float(profile.get("word_confidence_floor", 40.0) or 40.0),
-                        ),
+                        "words": words,
                         "image_width": width,
                         "image_height": height,
                         "strategy": {
@@ -2671,6 +2825,926 @@ def _render_pdf_page_preview(
         f"<img alt=\"PDF page preview\" src=\"data:image/png;base64,{preview['data']}\" "
         f"width=\"{preview['width']}\" height=\"{preview['height']}\" />"
         "</figure>"
+    )
+
+
+def _cluster_reconstructed_positions(values: list[float], *, tolerance: float) -> list[float]:
+    if not values:
+        return []
+    ordered = sorted(values)
+    clusters: list[list[float]] = [[ordered[0]]]
+    for value in ordered[1:]:
+        if abs(value - clusters[-1][-1]) <= tolerance:
+            clusters[-1].append(value)
+        else:
+            clusters.append([value])
+    return [sum(cluster) / len(cluster) for cluster in clusters]
+
+
+def _annotate_reconstructed_item(page_width: float, page_height: float, item: dict[str, Any]) -> dict[str, Any]:
+    x0, y0, x1, y1 = item["bbox"]
+    width = max(0.0, x1 - x0)
+    height = max(0.0, y1 - y0)
+    center_x = (x0 + x1) / 2
+    center_y = (y0 + y1) / 2
+    item["width_ratio"] = width / page_width
+    item["height_ratio"] = height / page_height
+    item["center_x"] = center_x / page_width
+    item["center_y"] = center_y / page_height
+    item["center_y_abs"] = center_y
+    html = str(item.get("html", ""))
+    item["is_heading"] = "<h3>" in html or "<h4>" in html
+    item["is_list"] = "<ul>" in html or "<ol>" in html
+    item["is_table"] = item.get("kind") == "table"
+    return item
+
+
+def _should_skip_reconstructed_item(item: dict[str, Any], *, page_height: float) -> bool:
+    if item.get("is_table") or item.get("is_heading"):
+        return False
+    html = str(item.get("html", ""))
+    text = re.sub(r"<[^>]+>", " ", html)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return True
+    if (
+        item.get("kind") == "text"
+        and float(item["bbox"][1]) >= page_height * 0.82
+        and float(item.get("width_ratio", 0.0)) >= 0.72
+        and float(item.get("height_ratio", 1.0)) <= 0.045
+        and len(text) >= 28
+    ):
+        return True
+    return False
+
+
+def _reconstructed_items_share_row(item: dict[str, Any], row: list[dict[str, Any]]) -> bool:
+    row_top = min(float(entry["bbox"][1]) for entry in row)
+    row_bottom = max(float(entry["bbox"][3]) for entry in row)
+    row_height = max(row_bottom - row_top, 1.0)
+    row_center = sum(float(entry.get("center_y_abs", (entry["bbox"][1] + entry["bbox"][3]) / 2)) for entry in row) / len(row)
+    item_top = float(item["bbox"][1])
+    item_bottom = float(item["bbox"][3])
+    item_center = float(item.get("center_y_abs", (item_top + item_bottom) / 2))
+    overlap = min(item_bottom, row_bottom) - max(item_top, row_top)
+    if overlap >= min(item_bottom - item_top, row_height) * 0.2:
+        return True
+    return abs(item_center - row_center) <= max(8.0, row_height * 0.42)
+
+
+def _resolve_reconstructed_grid_span(
+    item: dict[str, Any],
+    column_centers: list[float],
+    *,
+    page_width: float,
+) -> tuple[int, int]:
+    x0, _y0, x1, _y1 = item["bbox"]
+    if not column_centers:
+        start_col = max(1, min(12, int((x0 / page_width) * 12) + 1))
+        end_col = max(start_col + 1, min(13, int(((x1 / page_width) * 12) + 1.999)))
+        return start_col, end_col
+
+    normalized_centers = [center / page_width for center in column_centers]
+    center_x = float(item.get("center_x", 0.5))
+    nearest_index = min(range(len(normalized_centers)), key=lambda idx: abs(normalized_centers[idx] - center_x))
+    span = 12
+    if len(column_centers) == 2:
+        span = 6
+    elif len(column_centers) >= 3:
+        span = 4
+    start_col = 1 + nearest_index * span
+    end_col = min(13, start_col + span)
+
+    width_ratio = float(item.get("width_ratio", 1.0))
+    if width_ratio >= 0.82 or item.get("is_table"):
+        return 1, 13
+    if width_ratio >= 0.58 and len(column_centers) >= 2:
+        return 1, 13
+    if width_ratio <= 0.22 and len(column_centers) == 1:
+        start_col = max(2, min(9, int(center_x * 12)))
+        end_col = min(13, start_col + 3)
+    return start_col, end_col
+
+
+def _build_reconstructed_ocr_items(
+    page_width: float,
+    page_height: float,
+    ocr_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    words = ocr_payload.get("words", [])
+    image_width = max(int(ocr_payload.get("image_width", 0) or 0), 1)
+    image_height = max(int(ocr_payload.get("image_height", 0) or 0), 1)
+    if not isinstance(words, list) or not words:
+        return []
+
+    prepared: list[dict[str, Any]] = []
+    heights: list[float] = []
+    for word in words:
+        if not isinstance(word, dict):
+            continue
+        text = str(word.get("text", "")).strip()
+        bbox = word.get("bbox", [])
+        if not text or not isinstance(bbox, list) or len(bbox) != 4:
+            continue
+        x0, y0, x1, y1 = [float(value) for value in bbox]
+        if x1 <= x0 or y1 <= y0:
+            continue
+        heights.append(y1 - y0)
+        prepared.append({"text": text, "bbox": [x0, y0, x1, y1]})
+    if not prepared:
+        return []
+
+    median_height = sorted(heights)[len(heights) // 2] if heights else 12.0
+    line_tolerance = max(10.0, median_height * 0.85)
+    prepared.sort(key=lambda item: ((item["bbox"][1] + item["bbox"][3]) / 2, item["bbox"][0]))
+
+    lines: list[list[dict[str, Any]]] = []
+    for word in prepared:
+        center_y = (word["bbox"][1] + word["bbox"][3]) / 2
+        placed = False
+        for line in lines:
+            line_center = sum((entry["bbox"][1] + entry["bbox"][3]) / 2 for entry in line) / len(line)
+            if abs(center_y - line_center) <= line_tolerance:
+                line.append(word)
+                placed = True
+                break
+        if not placed:
+            lines.append([word])
+
+    items: list[dict[str, Any]] = []
+    for line in lines:
+        line.sort(key=lambda entry: entry["bbox"][0])
+        segments: list[list[dict[str, Any]]] = [[line[0]]]
+        for word in line[1:]:
+            prev = segments[-1][-1]
+            gap = float(word["bbox"][0]) - float(prev["bbox"][2])
+            if gap > max(median_height * 2.2, image_width * 0.05):
+                segments.append([word])
+            else:
+                segments[-1].append(word)
+        for segment in segments:
+            text = " ".join(entry["text"] for entry in segment).strip()
+            if not text:
+                continue
+            x0 = min(entry["bbox"][0] for entry in segment) / image_width * page_width
+            y0 = min(entry["bbox"][1] for entry in segment) / image_height * page_height
+            x1 = max(entry["bbox"][2] for entry in segment) / image_width * page_width
+            y1 = max(entry["bbox"][3] for entry in segment) / image_height * page_height
+            bbox = (x0, y0, x1, y1)
+            is_title = y0 <= page_height * 0.14 and len(text) <= 56
+            html = f"<h4>{escape(text)}</h4>" if is_title else f"<p>{escape(text)}</p>"
+            items.append(
+                _annotate_reconstructed_item(page_width, page_height, {
+                    "bbox": bbox,
+                    "kind": "text",
+                    "html": html,
+                    "height": max(0.0, y1 - y0),
+                    "width": max(0.0, x1 - x0),
+                })
+            )
+    return items
+
+
+def _project_ocr_words_to_page(
+    ocr_payload: dict[str, Any],
+    *,
+    page_width: float,
+    page_height: float,
+) -> list[dict[str, Any]]:
+    words = ocr_payload.get("words", [])
+    image_width = max(int(ocr_payload.get("image_width", 0) or 0), 1)
+    image_height = max(int(ocr_payload.get("image_height", 0) or 0), 1)
+    projected: list[dict[str, Any]] = []
+    for word in words if isinstance(words, list) else []:
+        if not isinstance(word, dict):
+            continue
+        text = str(word.get("text", "")).strip()
+        bbox = word.get("bbox", [])
+        if not text or not isinstance(bbox, list) or len(bbox) != 4:
+            continue
+        x0, y0, x1, y1 = [float(value) for value in bbox]
+        if x1 <= x0 or y1 <= y0:
+            continue
+        projected.append(
+            {
+                "text": text,
+                "confidence": float(word.get("confidence", 0.0) or 0.0),
+                "bbox": [
+                    x0 / image_width * page_width,
+                    y0 / image_height * page_height,
+                    x1 / image_width * page_width,
+                    y1 / image_height * page_height,
+                ],
+            }
+        )
+    return projected
+
+
+def _build_reconstructed_items_from_projected_words(
+    projected_words: list[dict[str, Any]],
+    *,
+    page_width: float,
+    page_height: float,
+) -> list[dict[str, Any]]:
+    if not projected_words:
+        return []
+
+    heights = [float(word["bbox"][3]) - float(word["bbox"][1]) for word in projected_words]
+    median_height = sorted(heights)[len(heights) // 2] if heights else 12.0
+    line_tolerance = max(10.0, median_height * 0.85)
+    prepared = sorted(projected_words, key=lambda item: ((item["bbox"][1] + item["bbox"][3]) / 2, item["bbox"][0]))
+
+    lines: list[list[dict[str, Any]]] = []
+    for word in prepared:
+        center_y = (word["bbox"][1] + word["bbox"][3]) / 2
+        placed = False
+        for line in lines:
+            line_center = sum((entry["bbox"][1] + entry["bbox"][3]) / 2 for entry in line) / len(line)
+            if abs(center_y - line_center) <= line_tolerance:
+                line.append(word)
+                placed = True
+                break
+        if not placed:
+            lines.append([word])
+
+    items: list[dict[str, Any]] = []
+    for line in lines:
+        line.sort(key=lambda entry: entry["bbox"][0])
+        segments: list[list[dict[str, Any]]] = [[line[0]]]
+        for word in line[1:]:
+            previous = segments[-1][-1]
+            gap = float(word["bbox"][0]) - float(previous["bbox"][2])
+            if gap > max(median_height * 2.2, page_width * 0.05):
+                segments.append([word])
+            else:
+                segments[-1].append(word)
+        for segment in segments:
+            text = " ".join(entry["text"] for entry in segment).strip()
+            if not text:
+                continue
+            x0 = min(entry["bbox"][0] for entry in segment)
+            y0 = min(entry["bbox"][1] for entry in segment)
+            x1 = max(entry["bbox"][2] for entry in segment)
+            y1 = max(entry["bbox"][3] for entry in segment)
+            bbox = (x0, y0, x1, y1)
+            is_title = y0 <= page_height * 0.14 and len(text) <= 56
+            html = f"<h4>{escape(text)}</h4>" if is_title else f"<p>{escape(text)}</p>"
+            items.append(
+                _annotate_reconstructed_item(page_width, page_height, {
+                    "bbox": bbox,
+                    "kind": "text",
+                    "html": html,
+                    "height": max(0.0, y1 - y0),
+                    "width": max(0.0, x1 - x0),
+                })
+            )
+    return items
+
+
+def _build_reconstructed_section_rows(
+    projected_words: list[dict[str, Any]],
+    *,
+    page_width: float,
+    page_height: float,
+) -> list[list[str]]:
+    if not projected_words:
+        return []
+
+    heights = [float(word["bbox"][3]) - float(word["bbox"][1]) for word in projected_words]
+    median_height = sorted(heights)[len(heights) // 2] if heights else 12.0
+    line_tolerance = max(10.0, median_height * 0.85)
+    prepared = sorted(projected_words, key=lambda item: ((item["bbox"][1] + item["bbox"][3]) / 2, item["bbox"][0]))
+
+    lines: list[list[dict[str, Any]]] = []
+    for word in prepared:
+        center_y = (word["bbox"][1] + word["bbox"][3]) / 2
+        placed = False
+        for line in lines:
+            line_center = sum((entry["bbox"][1] + entry["bbox"][3]) / 2 for entry in line) / len(line)
+            if abs(center_y - line_center) <= line_tolerance:
+                line.append(word)
+                placed = True
+                break
+        if not placed:
+            lines.append([word])
+
+    grouped_lines: list[list[tuple[float, float, list[str]]]] = []
+    column_signatures: list[float] = []
+    for line in lines:
+        line = sorted(line, key=lambda entry: entry["bbox"][0])
+        groups: list[list[dict[str, Any]]] = [[line[0]]]
+        for word in line[1:]:
+            previous = groups[-1][-1]
+            gap = float(word["bbox"][0]) - float(previous["bbox"][2])
+            if gap > max(median_height * 2.0, page_width * 0.04):
+                groups.append([word])
+            else:
+                groups[-1].append(word)
+        collapsed: list[tuple[float, float, list[str]]] = []
+        for group in groups:
+            x0 = min(entry["bbox"][0] for entry in group)
+            x1 = max(entry["bbox"][2] for entry in group)
+            collapsed.append((x0, x1, [entry["text"] for entry in group]))
+        grouped_lines.append(collapsed)
+        if not column_signatures and 2 <= len(collapsed) <= 8:
+            column_signatures = [(x0 + x1) / 2 for x0, x1, _texts in collapsed]
+
+    if not column_signatures:
+        centers = [((x0 + x1) / 2) for line in grouped_lines for x0, x1, _texts in line if (x1 - x0) <= page_width * 0.7]
+        column_signatures = _cluster_reconstructed_positions(centers, tolerance=page_width * 0.08)
+    if len(column_signatures) < 2:
+        return []
+    if len(column_signatures) > 8:
+        column_signatures = column_signatures[:8]
+
+    rows: list[list[str]] = []
+    for groups in grouped_lines:
+        aligned = _align_row_to_columns(groups, column_signatures)
+        if aligned:
+            rows.append(aligned)
+    widths = {len(row) for row in rows if row}
+    if len(rows) < 2 or len(widths) != 1:
+        return []
+    return rows
+
+
+def _extract_page_grid_segments(page: Any) -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float]]]:
+    horizontal: list[tuple[float, float, float]] = []
+    vertical: list[tuple[float, float, float]] = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return horizontal, vertical
+    for drawing in drawings:
+        for item in drawing.get("items", []):
+            if not item or item[0] != "l" or len(item) < 3:
+                continue
+            p1, p2 = item[1], item[2]
+            x1, y1 = float(getattr(p1, "x", 0.0)), float(getattr(p1, "y", 0.0))
+            x2, y2 = float(getattr(p2, "x", 0.0)), float(getattr(p2, "y", 0.0))
+            dx, dy = abs(x1 - x2), abs(y1 - y2)
+            if dy <= 2.5 and dx >= 18.0:
+                horizontal.append((round(min(x1, x2), 2), round(max(x1, x2), 2), round((y1 + y2) / 2, 2)))
+            elif dx <= 2.5 and dy >= 18.0:
+                vertical.append((round((x1 + x2) / 2, 2), round(min(y1, y2), 2), round(max(y1, y2), 2)))
+    return horizontal, vertical
+
+
+def _normalize_form_section_label(label: str) -> str:
+    normalized = re.sub(r"\s+", "", label or "")
+    if not normalized:
+        return ""
+    if "자격" in normalized or "면허" in normalized:
+        return "자격면허"
+    if "주거" in normalized or "재산" in normalized or normalized in {"주거", "재산"}:
+        return "주거/재산"
+    if "가족" in normalized or ("가" in normalized and "항" in normalized):
+        return "가족사항"
+    if "경력" in normalized or ("사" in normalized and "항" in normalized):
+        return "경력사항"
+    if "성적" in normalized or normalized == "점":
+        return "성적"
+    if "학" in normalized:
+        return "학력"
+    if "병" in normalized and "역" in normalized:
+        return "병역"
+    if "신" in normalized and "체" in normalized:
+        return "신체"
+    return re.sub(r"\s+", " ", label).strip()
+
+
+def _build_reconstructed_section_grid_rows(
+    projected_words: list[dict[str, Any]],
+    horizontal_segments: list[tuple[float, float, float]],
+    vertical_segments: list[tuple[float, float, float]],
+    section_bbox: tuple[float, float, float, float],
+) -> list[list[str]]:
+    x0, y0, x1, y1 = section_bbox
+    section_width = max(x1 - x0, 1.0)
+    section_height = max(y1 - y0, 1.0)
+    h_positions = []
+    for sx0, sx1, sy in horizontal_segments:
+        overlap = min(x1, sx1) - max(x0, sx0)
+        if sy < y0 - 2.0 or sy > y1 + 2.0:
+            continue
+        if overlap >= section_width * 0.45:
+            h_positions.append(sy)
+    v_positions = []
+    for sx, sy0, sy1 in vertical_segments:
+        overlap = min(y1, sy1) - max(y0, sy0)
+        if sx < x0 - 2.0 or sx > x1 + 2.0:
+            continue
+        if overlap >= section_height * 0.2:
+            v_positions.append(sx)
+
+    h_positions = _cluster_reconstructed_positions(h_positions + [y0, y1], tolerance=3.0)
+    v_positions = _cluster_reconstructed_positions(v_positions + [x0, x1], tolerance=3.0)
+    h_positions = sorted(value for value in h_positions if y0 - 1.0 <= value <= y1 + 1.0)
+    v_positions = sorted(value for value in v_positions if x0 - 1.0 <= value <= x1 + 1.0)
+    if len(h_positions) < 3 or len(v_positions) < 3:
+        return []
+
+    rows: list[list[str]] = []
+    for top, bottom in zip(h_positions, h_positions[1:]):
+        if bottom - top < 9.0:
+            continue
+        current_row: list[str] = []
+        row_words = [
+            word for word in projected_words
+            if ((float(word["bbox"][1]) + float(word["bbox"][3])) / 2) >= top
+            and ((float(word["bbox"][1]) + float(word["bbox"][3])) / 2) < bottom
+        ]
+        for left, right in zip(v_positions, v_positions[1:]):
+            if right - left < 12.0:
+                continue
+            cell_words = []
+            for word in row_words:
+                center_x = (float(word["bbox"][0]) + float(word["bbox"][2])) / 2
+                if center_x >= left and center_x < right:
+                    cell_words.append(word)
+            cell_words.sort(key=lambda word: (word["bbox"][1], word["bbox"][0]))
+            text = " ".join(str(word["text"]) for word in cell_words).strip()
+            current_row.append(text)
+        if any(cell.strip() for cell in current_row):
+            rows.append(current_row)
+    widths = {len(row) for row in rows if row}
+    if len(rows) < 2 or len(widths) != 1:
+        return []
+    return rows
+
+
+def _extract_reconstructed_page_title(
+    ocr_payload: dict[str, Any] | None,
+    *,
+    page_width: float,
+    page_height: float,
+    form_template: bool,
+) -> str:
+    if not ocr_payload:
+        return "이력서" if form_template else ""
+    words = ocr_payload.get("words", [])
+    if not isinstance(words, list) or not words:
+        return "이력서" if form_template else ""
+
+    top_words = []
+    for word in words:
+        if not isinstance(word, dict):
+            continue
+        bbox = word.get("bbox", [])
+        text = str(word.get("text", "")).strip()
+        if not text or not isinstance(bbox, list) or len(bbox) != 4:
+            continue
+        x0, y0, x1, y1 = [float(value) for value in bbox]
+        if y1 > page_height * 0.18 or x1 < page_width * 0.2 or x0 > page_width * 0.8:
+            continue
+        top_words.append((y0, x0, text, float(word.get("confidence", 0.0) or 0.0)))
+    top_words.sort(key=lambda item: (item[0], item[1]))
+    if not top_words:
+        return "이력서" if form_template else ""
+
+    text = "".join(item[2] for item in top_words if len(item[2]) <= 3 and not re.fullmatch(r"[A-Za-z0-9]+", item[2]))
+    text = re.sub(r"\s+", "", text)
+    if text and re.fullmatch(r"[가-힣]{2,6}", text):
+        return text
+    return "이력서" if form_template else text
+
+
+def _normalize_resume_section_label(label: str, *, y0: float, page_height: float) -> str:
+    cleaned = re.sub(r"\s+", "", label)
+    known = {
+        "학": "학력",
+        "학력": "학력",
+        "점": "성적",
+        "성적": "성적",
+        "za사항": "경력사항",
+        "경력사항": "경력사항",
+        "가Al항": "가족사항",
+        "가족사항": "가족사항",
+        "주거": "주거",
+    }
+    if cleaned in known:
+        return known[cleaned]
+    if y0 < page_height * 0.48:
+        return "학력"
+    if y0 < page_height * 0.60:
+        return "성적"
+    if y0 < page_height * 0.73:
+        return "경력사항"
+    if y0 < page_height * 0.89:
+        return "가족사항"
+    return "주거"
+
+
+def _render_reconstructed_form_table(
+    page: Any,
+    diagram: dict[str, Any] | None,
+    ocr_payload: dict[str, Any] | None,
+) -> str:
+    page_width = max(float(page.rect.width or 0.0), 1.0)
+    page_height = max(float(page.rect.height or 0.0), 1.0)
+    projected_words = _project_ocr_words_to_page(ocr_payload or {}, page_width=page_width, page_height=page_height)
+    horizontal_segments, vertical_segments = _extract_page_grid_segments(page)
+    if not projected_words:
+        return ""
+
+    section_boxes = []
+    for box in (diagram or {}).get("boxes", []):
+        if not isinstance(box, dict):
+            continue
+        bbox = box.get("bbox", [])
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            continue
+        x0, y0, x1, y1 = [float(value) for value in bbox]
+        if x0 > page_width * 0.18 or (x1 - x0) > page_width * 0.38 or (y1 - y0) < page_height * 0.04:
+            continue
+        section_boxes.append((x0, y0, x1, y1, str(box.get("label", "")).strip()))
+    section_boxes.sort(key=lambda item: (item[1], item[0]))
+    if not section_boxes:
+        return ""
+
+    top_cutoff = section_boxes[0][1]
+    top_words = [
+        word
+        for word in projected_words
+        if float(word["bbox"][1]) <= top_cutoff - page_height * 0.02
+    ]
+    title = _extract_reconstructed_page_title(
+        ocr_payload,
+        page_width=page_width,
+        page_height=page_height,
+        form_template=True,
+    )
+
+    header_grid_top = None
+    for _x0, _x1, sy in horizontal_segments:
+        if sy < top_cutoff - page_height * 0.02:
+            if header_grid_top is None or sy < header_grid_top:
+                header_grid_top = sy
+    if header_grid_top is None:
+        header_grid_top = page_height * 0.15
+    top_band_words = [
+        word
+        for word in projected_words
+        if header_grid_top - page_height * 0.01 <= float(word["bbox"][1]) <= top_cutoff + page_height * 0.01
+    ]
+    top_band_rows = _build_reconstructed_section_grid_rows(
+        top_band_words,
+        horizontal_segments,
+        vertical_segments,
+        (page_width * 0.04, header_grid_top, page_width * 0.96, top_cutoff + page_height * 0.01),
+    )
+    if not top_band_rows:
+        top_band_rows = _build_reconstructed_section_rows(
+            top_band_words,
+            page_width=page_width,
+            page_height=page_height,
+        )
+    top_table = ""
+    if top_band_rows:
+        top_table = "<section class=\"pdf-form-overview\">" + _render_table_rows(top_band_rows, None, inferred=False)[0] + "</section>"
+
+    section_html: list[str] = []
+    for index, (x0, y0, x1, y1, raw_label) in enumerate(section_boxes):
+        label = _normalize_resume_section_label(raw_label, y0=y0, page_height=page_height)
+        next_top = section_boxes[index + 1][1] if index + 1 < len(section_boxes) else page_height * 0.97
+        content_words = [
+            word
+            for word in projected_words
+            if float(word["bbox"][1]) >= y0 - page_height * 0.01
+            and float(word["bbox"][3]) <= next_top + page_height * 0.01
+            and float(word["bbox"][0]) >= min(x1 + page_width * 0.01, page_width * 0.42)
+        ]
+        rows = _build_reconstructed_section_grid_rows(
+            content_words,
+            horizontal_segments,
+            vertical_segments,
+            (min(x1 + page_width * 0.01, page_width * 0.42), y0, page_width * 0.98, next_top),
+        )
+        if not rows:
+            rows = _build_reconstructed_section_rows(
+                content_words,
+                page_width=page_width,
+                page_height=page_height,
+            )
+        table_html = ""
+        if rows:
+            table_html = _render_table_rows(rows, None, inferred=False)[0]
+        if not table_html:
+            continue
+        section_html.append(
+            "<section class=\"pdf-form-section\">"
+            f"<header><h2>{escape(label)}</h2></header>"
+            f"{table_html}"
+            "</section>"
+        )
+
+    if not section_html and not top_table:
+        return ""
+
+    return (
+        "<article class=\"pdf-reconstructed pdf-reconstructed-form\">"
+        f"<header class=\"pdf-form-title\"><h1>{escape(title)}</h1></header>"
+        "<main class=\"pdf-reconstructed-page pdf-reconstructed-form\">"
+        f"{top_table}"
+        f"{''.join(section_html)}"
+        "</main></article>"
+    )
+
+
+def _extract_reconstructed_form_sections(
+    diagram: dict[str, Any] | None,
+    ocr_payload: dict[str, Any] | None,
+    *,
+    page: Any | None = None,
+    page_width: float,
+    page_height: float,
+) -> list[dict[str, Any]]:
+    if not diagram or not ocr_payload:
+        return []
+
+    boxes = diagram.get("boxes", [])
+    if not isinstance(boxes, list):
+        return []
+    section_boxes = []
+    normalized_boxes: list[dict[str, Any]] = []
+    for box in boxes:
+        if not isinstance(box, dict):
+            continue
+        bbox = box.get("bbox", [])
+        label = str(box.get("label", "")).strip()
+        if not label or not isinstance(bbox, list) or len(bbox) != 4:
+            continue
+        x0, y0, x1, y1 = [float(value) for value in bbox]
+        width = x1 - x0
+        height = y1 - y0
+        normalized_boxes.append({"label": label, "bbox": [x0, y0, x1, y1]})
+        if x0 > page_width * 0.18:
+            continue
+        if width > page_width * 0.34:
+            continue
+        if height < page_height * 0.04:
+            continue
+        if not label:
+            related_labels = [
+                str(other["label"])
+                for other in normalized_boxes
+                if other["label"]
+                and abs(float(other["bbox"][1]) - y0) <= page_height * 0.03
+                and float(other["bbox"][0]) <= page_width * 0.55
+                and float(other["bbox"][0]) >= page_width * 0.3
+            ]
+            if any("재" in candidate or "산" in candidate for candidate in related_labels):
+                label = "주거/재산"
+            elif y0 >= page_height * 0.82:
+                label = "주거/재산"
+        if not label:
+            continue
+        section_boxes.append({"label": re.sub(r"\s+", " ", label), "bbox": [x0, y0, x1, y1]})
+    section_boxes.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
+    if len(section_boxes) < 3:
+        return []
+
+    projected_words = _project_ocr_words_to_page(ocr_payload, page_width=page_width, page_height=page_height)
+    horizontal_segments: list[tuple[float, float, float]] = []
+    vertical_segments: list[tuple[float, float, float]] = []
+    if page is not None:
+        horizontal_segments, vertical_segments = _extract_page_grid_segments(page)
+    sections: list[dict[str, Any]] = []
+    if section_boxes:
+        top_limit = float(section_boxes[0]["bbox"][1])
+        top_words = [
+            word for word in projected_words
+            if float(word["bbox"][1]) < top_limit - page_height * 0.01
+        ]
+        top_rows = []
+        if page is not None and top_words:
+            top_rows = _build_reconstructed_section_grid_rows(
+                top_words,
+                horizontal_segments,
+                vertical_segments,
+                (page_width * 0.05, page_height * 0.1, page_width * 0.96, top_limit - page_height * 0.01),
+            )
+        if top_rows:
+            sections.append(
+                {
+                    "label": "인적사항",
+                    "bbox": [page_width * 0.05, page_height * 0.1, page_width * 0.96, top_limit - page_height * 0.01],
+                    "items": [],
+                    "rows": top_rows,
+                }
+            )
+    for index, box in enumerate(section_boxes):
+        y0 = float(box["bbox"][1])
+        y1 = float(box["bbox"][3])
+        next_top = float(section_boxes[index + 1]["bbox"][1]) if index + 1 < len(section_boxes) else page_height * 0.97
+        section_bottom = max(y1, next_top)
+        content_left = min(page_width * 0.22, float(box["bbox"][2]) + page_width * 0.015)
+        section_words = [
+            word
+            for word in projected_words
+            if float(word["bbox"][0]) >= content_left
+            and float(word["bbox"][1]) >= y0 - page_height * 0.008
+            and float(word["bbox"][3]) <= section_bottom + page_height * 0.01
+        ]
+        items = _build_reconstructed_items_from_projected_words(
+            section_words,
+            page_width=page_width,
+            page_height=page_height,
+        )
+        rows = _build_reconstructed_section_grid_rows(
+            section_words,
+            horizontal_segments,
+            vertical_segments,
+            (content_left, y0, page_width * 0.98, section_bottom),
+        )
+        if not rows:
+            rows = _build_reconstructed_section_rows(
+                section_words,
+                page_width=page_width,
+                page_height=page_height,
+            )
+        if not items:
+            continue
+        sections.append(
+            {
+                "label": _normalize_form_section_label(str(box["label"])),
+                "bbox": [content_left, y0, page_width * 0.98, section_bottom],
+                "items": items,
+                "rows": rows,
+            }
+        )
+    return sections
+
+
+def _infer_reconstructed_page_kind(items: list[dict[str, Any]], ocr_payload: dict[str, Any] | None) -> str:
+    if not items:
+        return "content"
+    tables = sum(1 for item in items if item.get("is_table"))
+    headings = sum(1 for item in items if item.get("is_heading"))
+    narrow = sum(1 for item in items if float(item.get("width_ratio", 1.0)) <= 0.34)
+    if ocr_payload and not tables and len(items) >= 14 and narrow >= max(8, len(items) // 2) and headings <= max(4, len(items) // 8):
+        return "form"
+    return "content"
+
+
+def _reconstructed_row_tag(page_kind: str, row: list[dict[str, Any]]) -> str:
+    if row and all(item.get("is_heading") for item in row):
+        return "header"
+    if page_kind == "form":
+        return "fieldset"
+    return "section"
+
+
+def _reconstructed_item_tag(page_kind: str, item: dict[str, Any]) -> str:
+    if item.get("is_heading"):
+        return "div"
+    if item.get("is_table"):
+        return "section"
+    if page_kind == "form":
+        return "article"
+    return "article"
+
+
+def _render_pdf_page_reconstructed(
+    page: Any,
+    blocks: list[dict[str, Any]],
+    tables: list[dict[str, Any]],
+    table_bboxes: list[tuple[float, float, float, float]],
+    semantic_body: str,
+    ocr_payload: dict[str, Any] | None = None,
+    diagram: dict[str, Any] | None = None,
+) -> str:
+    page_width = max(float(page.rect.width or 0.0), 1.0)
+    page_height = max(float(page.rect.height or 0.0), 1.0)
+    items: list[dict[str, Any]] = []
+
+    for block in blocks:
+        if block.get("type") != 0:
+            continue
+        bbox = tuple(float(value) for value in block.get("bbox", (0.0, 0.0, 0.0, 0.0)))
+        if any(_bbox_overlaps(bbox, table_bbox) for table_bbox in table_bboxes):
+            continue
+        _text, block_html, _markdown = _render_pymupdf_text_block(block)
+        if not block_html:
+            continue
+        items.append(
+            _annotate_reconstructed_item(page_width, page_height, {
+                "bbox": bbox,
+                "kind": "text",
+                "html": block_html,
+                "height": max(0.0, bbox[3] - bbox[1]),
+                "width": max(0.0, bbox[2] - bbox[0]),
+            })
+        )
+
+    for table in tables:
+        bbox = tuple(float(value) for value in table.get("bbox", (0.0, 0.0, 0.0, 0.0)))
+        if not table.get("html"):
+            continue
+        items.append(
+            _annotate_reconstructed_item(page_width, page_height, {
+                "bbox": bbox,
+                "kind": "table",
+                "html": table["html"],
+                "height": max(0.0, bbox[3] - bbox[1]),
+                "width": max(0.0, bbox[2] - bbox[0]),
+            })
+        )
+
+    if not items and ocr_payload:
+        items = _build_reconstructed_ocr_items(page_width, page_height, ocr_payload)
+    items = [item for item in items if not _should_skip_reconstructed_item(item, page_height=page_height)]
+    items.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
+    if not items:
+        if semantic_body:
+            return (
+                "<article class=\"pdf-reconstructed pdf-reconstructed-content\">"
+                "<div class=\"pdf-reconstructed-page\">"
+                f"{semantic_body}</div></article>"
+            )
+        return ""
+
+    page_kind = _infer_reconstructed_page_kind(items, ocr_payload)
+    rows: list[list[dict[str, Any]]] = []
+    for item in items:
+        placed = False
+        for row in rows:
+            if _reconstructed_items_share_row(item, row):
+                row.append(item)
+                placed = True
+                break
+        if not placed:
+            rows.append([item])
+
+    if page_kind == "form":
+        form_html = _render_reconstructed_form_table(page, diagram, ocr_payload)
+        if form_html:
+            return form_html
+
+    row_html: list[str] = []
+    previous_bottom = 0.0
+    for row_index, row in enumerate(rows, start=1):
+        row.sort(key=lambda entry: (entry["bbox"][0], entry["bbox"][1]))
+        row_top = min(entry["bbox"][1] for entry in row)
+        row_bottom = max(entry["bbox"][3] for entry in row)
+        row_height = max(row_bottom - row_top, 1.0)
+        gap = max(0.0, row_top - previous_bottom)
+        row_style = ""
+        if gap > 4.0:
+            margin_top = min(max(gap / page_height * 280.0, 0.0), 28.0)
+            if margin_top > 0.0:
+                row_style = f" style=\"margin-top:{margin_top:.1f}px;\""
+        row_column_centers = _cluster_reconstructed_positions(
+            [float(entry["bbox"][0] + entry["bbox"][2]) / 2 for entry in row if float(entry.get("width_ratio", 1.0)) < 0.72],
+            tolerance=page_width * 0.14,
+        )
+        if len(row_column_centers) > 3:
+            row_column_centers = row_column_centers[:3]
+        row_classes = ["pdf-reconstructed-row"]
+        if len(row_column_centers) >= 2:
+            row_classes.append(f"columns-{min(len(row_column_centers), 3)}")
+        row_tag = _reconstructed_row_tag(page_kind, row)
+        if page_kind == "form" and row_tag == "fieldset":
+            row_classes.append("form-row")
+        parts: list[str] = []
+        for item in row:
+            start_col, end_col = _resolve_reconstructed_grid_span(item, row_column_centers, page_width=page_width)
+            classes = ["pdf-reconstructed-item", item["kind"]]
+            if item["width"] <= page_width * 0.28:
+                classes.append("narrow")
+            if item["is_heading"] and float(item.get("center_x", 0.5)) >= 0.25 and float(item.get("center_x", 0.5)) <= 0.75:
+                classes.append("centered")
+            if item["width"] >= page_width * 0.82 or item["is_table"]:
+                classes.append("full-width")
+            if item["kind"] == "text" and item["height"] <= page_height * 0.08 and item["width"] <= page_width * 0.7 and not item["is_heading"]:
+                classes.append("callout")
+            if len(row) >= 2 and row_height <= page_height * 0.12 and item["width"] <= page_width * 0.32:
+                classes.append("narrow")
+            if page_kind == "form" and not item.get("is_heading") and not item.get("is_table"):
+                classes.append("form-field")
+            item_tag = _reconstructed_item_tag(page_kind, item)
+            parts.append(
+                f"<{item_tag} class=\"{' '.join(classes)}\" style=\"grid-column:{start_col} / {end_col};\">{item['html']}</{item_tag}>"
+            )
+        if row_tag == "fieldset":
+            legend = f"<legend>Field Group {row_index}</legend>" if row_index <= 3 else ""
+            row_html.append(f"<fieldset class=\"{' '.join(row_classes)}\"{row_style}>{legend}{''.join(parts)}</fieldset>")
+        else:
+            row_html.append(f"<{row_tag} class=\"{' '.join(row_classes)}\"{row_style}>{''.join(parts)}</{row_tag}>")
+        previous_bottom = row_bottom
+
+    summary = (
+        "<header class=\"pdf-reconstructed-summary\">"
+        f"<p>Reconstructed DOM mode: {'form-like' if page_kind == 'form' else 'content-focused'} page layout.</p>"
+        "</header>"
+    )
+    page_tag = "form" if page_kind == "form" else "main"
+    page_class = f"pdf-reconstructed-page pdf-reconstructed-{page_kind}"
+    return (
+        f"<article class=\"pdf-reconstructed pdf-reconstructed-{page_kind}\">"
+        f"{summary}"
+        f"<{page_tag} class=\"{page_class}\">{''.join(row_html)}</{page_tag}>"
+        "</article>"
     )
 
 

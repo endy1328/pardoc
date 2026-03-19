@@ -15,6 +15,7 @@ if not SAMPLE_PDF.exists():
     SAMPLE_PDF = PROJECT_ROOT / "pdf_sample" / "12장 조달관리.pdf"
 SNAPSHOT_DIR = PROJECT_ROOT / "tests" / "snapshots"
 PDF_SAMPLE_DIR = PROJECT_ROOT / "pdf_sample"
+PROFILE_FORM_PDF = PDF_SAMPLE_DIR / "profile_form.pdf"
 PDF_BACKEND_AVAILABLE = bool(importlib.util.find_spec("fitz") or importlib.util.find_spec("pypdf"))
 
 
@@ -60,6 +61,44 @@ class PdfRegressionTests(unittest.TestCase):
         if page_two["ocr_strategy"]:
             self.assertIn("trials", page_two["ocr_strategy"])
             self.assertIn("stop_reason", page_two["ocr_strategy"])
+
+    def test_reconstructed_pdf_mode_avoids_background_page_image(self) -> None:
+        result = convert_file(
+            SAMPLE_PDF,
+            ConversionOptions(
+                pdf_mode="reconstructed",
+                page_numbers={1, 2, 4},
+                cache_dir=self.cache_dir,
+            ),
+        )
+
+        html = result.html
+        self.assertIn("pdf-reconstructed", html)
+        self.assertIn("<article class=\"pdf-reconstructed", html)
+        self.assertNotIn('<img class="pdf-page-bg"', html)
+        self.assertNotIn('<figure class="pdf-preview">', html)
+        self.assertIn("Page 1", html)
+        self.assertNotIn("본자료는올포피엠의지식자산으로무단으로타인에게배포되거나상업적용도로사용하시면처벌을받을수있습니다.", html)
+
+    @unittest.skipUnless(PROFILE_FORM_PDF.exists(), "profile_form sample is required")
+    def test_reconstructed_pdf_mode_uses_ocr_word_layout_for_form_sample(self) -> None:
+        result = convert_file(
+            PROFILE_FORM_PDF,
+            ConversionOptions(
+                pdf_mode="reconstructed",
+                page_numbers={1},
+                cache_dir=self.cache_dir,
+            ),
+        )
+
+        html = result.html
+        self.assertIn("pdf-reconstructed", html)
+        self.assertNotIn("<pre>", html)
+        self.assertIn("<h1>이력서</h1>", html)
+        self.assertIn("<main class=\"pdf-reconstructed-page pdf-reconstructed-form\">", html)
+        self.assertIn("pdf-form-overview", html)
+        self.assertIn("pdf-form-section", html)
+        self.assertIn("<table>", html)
 
     def test_second_run_reports_cache_hits_for_raster_and_tables(self) -> None:
         options = ConversionOptions(
