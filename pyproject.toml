@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pardoc"
+version = "0.1.0"
+description = "Convert office documents and PDFs into HTML and text."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "mammoth>=1.8.0",
+  "openpyxl>=3.1.5",
+  "pdfplumber>=0.11.9",
+  "pillow>=12.1.1",
+  "pymupdf>=1.27.2",
+  "pypdf>=5.4.0",
+  "pytesseract>=0.3.13",
+  "xlrd>=2.0.1",
+]
+
+[project.scripts]
+pardoc = "pardoc.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

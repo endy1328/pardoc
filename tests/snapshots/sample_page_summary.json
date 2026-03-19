@@ -1,0 +1,87 @@
+[
+  {
+    "page": 1,
+    "layout": "diagram",
+    "dominant_signal": "diagram",
+    "table_count": 0,
+    "diagram": {
+      "boxes": 1,
+      "connectors": 0,
+      "edges": 0
+    },
+    "ocr": {
+      "status": "native-text",
+      "psm": null,
+      "variant": null,
+      "stop_reason": null
+    }
+  },
+  {
+    "page": 2,
+    "layout": "diagram",
+    "dominant_signal": "diagram",
+    "table_count": 0,
+    "diagram": {
+      "boxes": 0,
+      "connectors": 0,
+      "edges": 0
+    },
+    "ocr": {
+      "status": "ocr-auto",
+      "psm": 11,
+      "variant": "base",
+      "stop_reason": "excellent-confidence"
+    }
+  },
+  {
+    "page": 3,
+    "layout": "text",
+    "dominant_signal": "text",
+    "table_count": 1,
+    "diagram": {
+      "boxes": 12,
+      "connectors": 20,
+      "edges": 5
+    },
+    "ocr": {
+      "status": "native-text",
+      "psm": null,
+      "variant": null,
+      "stop_reason": null
+    }
+  },
+  {
+    "page": 4,
+    "layout": "mixed",
+    "dominant_signal": "text+diagram",
+    "table_count": 0,
+    "diagram": {
+      "boxes": 0,
+      "connectors": 0,
+      "edges": 0
+    },
+    "ocr": {
+      "status": "native-text",
+      "psm": null,
+      "variant": null,
+      "stop_reason": null
+    }
+  },
+  {
+    "page": 5,
+    "layout": "text",
+    "dominant_signal": "text",
+    "table_count": 0,
+    "diagram": {
+      "boxes": 0,
+      "connectors": 0,
+      "edges": 0
+    },
+    "ocr": {
+      "status": "native-text",
+      "psm": null,
+      "variant": null,
+      "stop_reason": null
+    }
+  }
+]

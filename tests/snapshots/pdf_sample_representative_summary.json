@@ -1,0 +1,41 @@
+[
+  {
+    "file": "12장 조달관리.pdf",
+    "layout": "diagram",
+    "dominant_signal": "diagram",
+    "table_count": 0,
+    "diagram": {
+      "boxes": 1,
+      "connectors": 0,
+      "edges": 0
+    },
+    "ocr_status": "native-text",
+    "markdown_head": "## Page 1\n\n### 12. 프로젝트조달관리 (Project Procurement Management)\n\n> Diagram hints | boxes: 1 | connectors: 0 | edges: 0 | unlabeled boxes: 0\n- Box 1 [native]: 12. 프로젝트조달관리 (Project Procurement Management)"
+  },
+  {
+    "file": "250106_설비기획섹션_Centrifuge Pusher Manual.pdf",
+    "layout": "text",
+    "dominant_signal": "text",
+    "table_count": 0,
+    "diagram": {
+      "boxes": 0,
+      "connectors": 0,
+      "edges": 0
+    },
+    "ocr_status": "native-text",
+    "markdown_head": "## Page 1\n\n### 조립 및 사용 설명서 푸셔 원심분리기 모델\n\n기계 모델:\n"
+  },
+  {
+    "file": "250507_P-DX AI미팅_순번 2. BPED P&ID.pdf",
+    "layout": "mixed",
+    "dominant_signal": "text+table",
+    "table_count": 4,
+    "diagram": {
+      "boxes": 0,
+      "connectors": 158,
+      "edges": 0
+    },
+    "ocr_status": "native-text",
+    "markdown_head": "## Page 1\n\n#### E\n\n#### B\n"
+  }
+]

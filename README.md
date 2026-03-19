@@ -1,0 +1,276 @@
+# pardoc
+
+`docx`, `doc`, `pdf`, `xlsx`, `xls` 같은 문서를 `html`, `text`, `markdown`, `json(debug)`으로 변환하는 CLI입니다.
+현재 구현의 중심은 PDF 경로이며, 구조 추출, OCR, 캐시, diagram 힌트, regression suite까지 포함합니다.
+
+## 지원 형식
+
+- `.docx`: `mammoth`
+- `.doc`: `LibreOffice(soffice)` 경유
+- `.pdf`: `PyMuPDF` 우선, 필요 시 `pypdf` fallback
+- `.xlsx`, `.xlsm`, `.xltx`, `.xltm`: `openpyxl`
+- `.xls`: `xlrd`
+- `.txt`, `.md`, `.csv`, `.tsv`, `.html`: 단순 입력
+
+지원 입력 포맷 요약:
+
+- `.docx`
+- `.doc`
+- `.pdf`
+- `.xlsx`
+- `.xlsm`
+- `.xltx`
+- `.xltm`
+- `.xls`
+- `.txt`
+- `.md`
+- `.csv`
+- `.tsv`
+- `.html`
+- `.htm`
+
+## 출력 포맷
+
+기본 출력 포맷:
+
+- `text` -> `.txt`
+- `html` -> `.html`
+- `markdown` -> `.md`
+
+선택 출력 포맷:
+
+- `json(debug)` -> `.json` (`--json-output`)
+
+## PDF 기능
+
+- `faithful`, `semantic`, `hybrid` HTML 모드
+- direct Markdown 생성
+- borderless table inference, multi-line cell merge, adjacent table merge
+- page layout classification: `text`, `table`, `diagram`, `mixed`
+- diagram box / connector / inferred edge extraction
+- edge provenance (`direct` / `chain` / `branch`) and heuristic confidence
+- simple arrowhead-based direction hinting
+- routing-node-aware edge inference
+- OCR label backfill for unlabeled diagram boxes
+- OCR `auto`, `off`, `force`
+- page-type-aware OCR preprocessing
+- adaptive `psm` retry + early stop
+- selective OCR rescue variant expansion for weak text/table results
+- OCR confidence summary per page
+- raster / table / OCR cache
+- cache invalidation reason reporting
+- `--json-output`, `--show-analysis`, `--debug-overlays`
+
+## 설치
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+```
+
+추가 요구사항:
+
+- `.doc` 변환: `LibreOffice`와 `soffice`
+- OCR: `tesseract`와 필요한 언어 데이터
+
+## 기본 사용법
+
+단일 파일:
+
+```bash
+pardoc sample.docx
+```
+
+디렉터리 전체:
+
+```bash
+pardoc ./documents -o ./converted
+```
+
+Markdown만:
+
+```bash
+pardoc report.pdf --format markdown
+```
+
+faithful PDF HTML:
+
+```bash
+pardoc report.pdf --pdf-mode faithful
+```
+
+hybrid PDF HTML + Markdown:
+
+```bash
+pardoc report.pdf --pdf-mode hybrid --format all
+```
+
+일부 페이지만:
+
+```bash
+pardoc big.pdf --pages 1-3,8
+```
+
+강제 OCR:
+
+```bash
+pardoc scanned.pdf --ocr-mode force
+```
+
+강제 OCR + 병렬 처리 + 캐시:
+
+```bash
+pardoc scanned.pdf --ocr-mode force --ocr-workers 4 --ocr-dpi 300 --ocr-cache-dir .pardoc_cache
+```
+
+캐시 없이 강제 OCR:
+
+```bash
+pardoc scanned.pdf --ocr-mode force --no-ocr-cache
+```
+
+분석 요약과 JSON:
+
+```bash
+pardoc report.pdf --pdf-mode hybrid --pages 1-5 --format markdown --json-output --show-analysis
+```
+
+디버그 오버레이:
+
+```bash
+pardoc report.pdf --pdf-mode hybrid --debug-overlays --format html
+```
+
+기본 출력 디렉터리는 `./output`입니다.
+
+## 출력 파일
+
+- `sample.docx` -> `output/sample.txt`, `output/sample.html`
+- `report.pdf --format markdown` -> `output/report.md`
+- `report.pdf --format all` -> `output/report.txt`, `output/report.html`, `output/report.md`
+- `report.pdf --json-output` -> 기존 출력 + `output/report.json`
+
+## PDF 상태 / 분석 출력
+
+진행률 상태:
+
+- `native-text`
+- `ocr-auto`
+- `ocr-force`
+- `cache-hit`
+
+`--show-analysis`에는 다음 정보가 포함됩니다.
+
+- page layout / confidence
+- text, image, drawing block count
+- table count
+- dominant signal
+- OCR 평균 confidence, low-confidence ratio, selected `psm`
+- cache hit / miss / stale / write summary
+
+`--json-output`의 `debug.pages[*]`에는 다음 구조가 포함됩니다.
+
+- `layout`, `layout_confidence`, `dominant_signal`, `signal_scores`
+- `tables`
+- `diagram.boxes`, `diagram.connector_segments`, `diagram.edges`
+- `diagram.edges[*].provenance`, `diagram.edges[*].direction_hint`, `diagram.edges[*].confidence`, `diagram.edges[*].routing_nodes`
+- `ocr_confidence`
+- `ocr_strategy`
+- `cache`
+
+## 테스트
+
+빠른 단위 테스트:
+
+```bash
+PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_cache.py' -v
+```
+
+샘플 PDF snapshot regression:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_pdf_regression.py' -v
+```
+
+`pdf_sample` corpus regression:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_pdf_corpus_regression.py' -v
+```
+
+suite helper script:
+
+```bash
+scripts/run_test_suites.sh fast
+scripts/run_test_suites.sh sample
+scripts/run_test_suites.sh corpus
+scripts/run_test_suites.sh all
+```
+
+GitHub Actions workflow:
+
+- `.github/workflows/tests.yml`
+- `fast`: push / PR
+- `sample_pdf`: push / PR
+- `corpus_pdf`: nightly or manual dispatch
+
+snapshot update workflow:
+
+1. heuristic or parser change 후 관련 테스트를 실행합니다.
+2. 의도된 출력 변화라면 `tests/snapshots/*`를 새 결과로 갱신합니다.
+3. `test_pdf_regression.py`, `test_pdf_corpus_regression.py`를 다시 실행해 snapshot drift가 없는지 확인합니다.
+
+전체 테스트:
+
+```bash
+python3 -m compileall src tests
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
+```
+
+## 샘플 수동 검증
+
+```bash
+PYTHONPATH=src .venv/bin/python -m pardoc.cli 'pdf_sample/sample.pdf' \
+  --pdf-mode hybrid \
+  --pages 1-5 \
+  --format markdown \
+  --json-output \
+  --show-analysis \
+  -o /tmp/pardoc_manual_check
+```
+
+같은 명령을 2회 실행하면 cache-hit 경로를 확인할 수 있습니다.
+
+## GitHub 업로드 가이드
+
+권장 업로드 범위:
+
+- 포함: `src/`, `tests/`, `scripts/`, `.github/`, `README.md`, `TODO.md`, `pyproject.toml`, `requirements.txt`
+- 제외: `.venv/`, `.pardoc_cache*/`, `out/`, `output*/`, 로컬 임시 파일
+
+`pdf_sample/` 정책:
+
+- 기본값은 저장소 제외를 권장합니다.
+- 이유: 샘플 corpus 크기가 크고, 문서 저작권/재배포 가능 여부를 별도로 확인해야 할 수 있습니다.
+- 샘플이 꼭 필요하면 Git LFS 또는 별도 private storage/repo 분리를 권장합니다.
+
+
+
+공개 전 체크리스트:
+
+- `.gitignore`에 캐시, 가상환경, 산출물, 로컬 샘플이 제외되어 있는지 확인
+- `tests/`와 `tests/snapshots/`가 추적 대상인지 확인
+- GitHub Actions workflow가 의도한 범위(`fast`, `sample_pdf`, `corpus_pdf`)로 동작하는지 확인
+- 샘플 PDF를 올릴 경우 용량과 라이선스/배포 가능 여부를 확인
+- 민감한 `.env`, key, local credential 파일이 없는지 재확인
+
+## 제한 사항
+
+- diagram edge는 direct/chain/branch provenance와 confidence를 제공하지만, arrowhead 판정은 여전히 휴리스틱입니다.
+- branch-heavy diagram은 아직 그래프 최적화보다 휴리스틱 edge 생성에 가깝습니다.
+- connector-only drawing이 많은 문서는 debug JSON에는 남아도 Markdown/HTML summary에서는 숨깁니다.
+- OCR 품질은 문서군별로 차이가 있어 추가 tuning 여지가 있습니다.
+- `.doc` 변환은 `LibreOffice` 의존입니다.
+- `--debug-overlays`는 faithful 계열 HTML에서 가장 유의미합니다.
