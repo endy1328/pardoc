@@ -21,7 +21,7 @@ class ConversionError(RuntimeError):
     """Raised when a file cannot be converted."""
 
 
-CACHE_SCHEMA_VERSION = 9
+CACHE_SCHEMA_VERSION = 10
 
 
 @dataclass(slots=True)
@@ -872,7 +872,7 @@ def _precompute_document_ocr(
     if options.ocr_mode != "force":
         return {}
 
-    tasks: list[tuple[int, bytes, bool, int, str]] = []
+    tasks: list[tuple[int, bytes, bool, int, str, dict[str, Any], tuple[float, float]]] = []
     payloads: dict[int, dict[str, str]] = {}
     for index, page in enumerate(document, start=1):
         if index not in selected_pages:
@@ -880,6 +880,7 @@ def _precompute_document_ocr(
         page_dict = page.get_text("dict", sort=True)
         layout_hint = _analyze_pdf_page(page_dict.get("blocks", []), 0).layout
         profile = _build_ocr_profile(layout_hint, force=True)
+        diagram = _extract_pymupdf_diagram_primitives(page, page_dict)
         profile_token = _ocr_profile_cache_token(profile)
         cache_key = _build_page_cache_key("ocr", source_path, index, dpi=options.ocr_dpi, variant="force", profile=profile_token)
         cache_meta = _build_page_cache_metadata(source_path, document, index, dpi=options.ocr_dpi, variant="force", profile=profile_token)
@@ -899,7 +900,17 @@ def _precompute_document_ocr(
         )
         if not raster:
             continue
-        tasks.append((index, base64.b64decode(raster["data"]), True, options.ocr_dpi, profile["key"]))
+        tasks.append(
+            (
+                index,
+                base64.b64decode(raster["data"]),
+                True,
+                options.ocr_dpi,
+                profile["key"],
+                diagram,
+                (float(page.rect.width or 0.0), float(page.rect.height or 0.0)),
+            )
+        )
 
     if not tasks:
         return payloads
@@ -1407,14 +1418,29 @@ def _segment_length(start: tuple[float, float], end: tuple[float, float]) -> flo
     return ((end[0] - start[0]) ** 2 + (end[1] - start[1]) ** 2) ** 0.5
 
 
+def _box_label_text(box: dict[str, Any]) -> str:
+    return str(box.get("label", "") or "").strip()
+
+
+def _box_label_quality(box: dict[str, Any]) -> float:
+    label = _box_label_text(box)
+    if not label:
+        return 0.0
+    source = str(box.get("label_source", "") or "").strip().lower()
+    if source == "native":
+        return 1.0
+    if source == "ocr":
+        return 0.82
+    return 0.65
+
+
 def _find_connector_box_index(
     point: tuple[float, float],
     boxes: list[dict[str, Any]],
     *,
     tolerance: float = 14.0,
 ) -> int | None:
-    match_index: int | None = None
-    match_area: float | None = None
+    candidates: list[tuple[int, int, float, float, float]] = []
     for index, box in enumerate(boxes):
         bbox = box.get("bbox", [])
         if not isinstance(bbox, list) or len(bbox) < 4:
@@ -1422,11 +1448,24 @@ def _find_connector_box_index(
         rect = tuple(float(value) for value in bbox[:4])
         if not _point_near_bbox(point, rect, tolerance=tolerance):
             continue
+        label_quality = _box_label_quality(box)
         area = _bbox_area(rect)
-        if match_area is None or area < match_area:
-            match_index = index
-            match_area = area
-    return match_index
+        distance = min(
+            abs(point[0] - rect[0]),
+            abs(point[0] - rect[2]),
+            abs(point[1] - rect[1]),
+            abs(point[1] - rect[3]),
+        )
+        inside = int(rect[0] <= point[0] <= rect[2] and rect[1] <= point[1] <= rect[3])
+        candidates.append((index, inside, label_quality, -distance, -area))
+
+    if not candidates:
+        return None
+
+    labeled_candidates = [candidate for candidate in candidates if candidate[2] > 0.0]
+    search_space = labeled_candidates or candidates
+    best = max(search_space, key=lambda item: (item[1], item[2], item[3], item[4]))
+    return best[0]
 
 
 def _cluster_connector_points(
@@ -1475,21 +1514,41 @@ def _infer_diagram_edges(
     seen_edges: set[tuple[int, int, str]] = set()
     visited: set[int] = set()
     arrow_segments = arrow_segments or []
+    segment_lengths = [_segment_length(nodes[left], nodes[right]) for left, right in clustered_segments]
 
-    def is_routing_box(box_index: int) -> bool:
+    def is_routing_box(box_index: int, degree: int) -> bool:
         box = boxes[box_index]
         bbox = box.get("bbox", [])
         if not isinstance(bbox, list) or len(bbox) < 4:
             return False
         width = abs(float(bbox[2]) - float(bbox[0]))
         height = abs(float(bbox[3]) - float(bbox[1]))
-        return not box.get("label") and width <= 96.0 and height <= 36.0
+        if _box_label_text(box):
+            return False
+        small = width <= 96.0 and height <= 36.0
+        slender = max(width, height) >= 48.0 and min(width, height) <= 18.0
+        junction_like = degree >= 3 or (degree >= 2 and (small or slender))
+        return small or slender or junction_like
+
+    def component_axis(payloads: list[dict[str, Any]]) -> str:
+        xs = [nodes[item["node"]][0] for item in payloads]
+        ys = [nodes[item["node"]][1] for item in payloads]
+        if not xs or not ys:
+            return "horizontal"
+        return "horizontal" if (max(xs) - min(xs)) >= (max(ys) - min(ys)) else "vertical"
+
+    def ordered_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        axis = component_axis(payloads)
+        if axis == "vertical":
+            return sorted(payloads, key=lambda item: (round(nodes[item["node"]][1], 2), round(nodes[item["node"]][0], 2)))
+        return sorted(payloads, key=lambda item: (round(nodes[item["node"]][0], 2), round(nodes[item["node"]][1], 2)))
 
     def endpoint_arrow_score(endpoint: tuple[float, float], reference: tuple[float, float]) -> float:
         vx = reference[0] - endpoint[0]
         vy = reference[1] - endpoint[1]
         main_length = max((vx * vx + vy * vy) ** 0.5, 1.0)
         score = 0.0
+        wing_vectors: list[tuple[float, float]] = []
         for start, end in arrow_segments:
             if _points_close(start, endpoint, tolerance=10.0):
                 other = end
@@ -1498,28 +1557,78 @@ def _infer_diagram_edges(
             else:
                 continue
             length = _segment_length(endpoint, other)
-            if length < 6.0 or length > 22.0:
+            if length < 5.0 or length > 28.0:
                 continue
             wx = other[0] - endpoint[0]
             wy = other[1] - endpoint[1]
             dot = (wx * vx + wy * vy) / (length * main_length)
-            if dot <= 0.2:
+            if dot <= 0.05:
                 continue
             score += 1.0
+            wing_vectors.append((wx / length, wy / length))
+        if len(wing_vectors) >= 2:
+            for left in range(len(wing_vectors) - 1):
+                for right in range(left + 1, len(wing_vectors)):
+                    cross = abs(
+                        wing_vectors[left][0] * wing_vectors[right][1]
+                        - wing_vectors[left][1] * wing_vectors[right][0]
+                    )
+                    if cross >= 0.25:
+                        score += 0.35
+            if len(wing_vectors) >= 3:
+                score += 0.20
         return score
 
-    def choose_root_index(payloads: list[tuple[int, int]], component_provenance: str) -> int:
-        labeled_payloads = [item for item in payloads if boxes[item[1]].get("label")]
+    def choose_root_index(payloads: list[dict[str, Any]], component_provenance: str) -> int:
+        labeled_payloads = [item for item in payloads if _box_label_quality(boxes[item["box"]]) > 0.0]
         candidates = labeled_payloads or payloads
         if len(candidates) == 1:
-            return candidates[0][1]
-        ordered = sorted(
-            candidates,
-            key=lambda item: (round(nodes[item[0]][1], 2), round(nodes[item[0]][0], 2))
-            if component_provenance == "branch"
-            else (round(nodes[item[0]][0], 2), round(nodes[item[0]][1], 2))
-        )
-        return ordered[0][1]
+            return candidates[0]["box"]
+        axis = component_axis(candidates)
+
+        def root_sort_key(item: dict[str, Any]) -> tuple[float, float, float, float]:
+            x, y = nodes[item["node"]]
+            primary = y if axis == "vertical" else x
+            secondary = x if axis == "vertical" else y
+            return (-_box_label_quality(boxes[item["box"]]), round(primary, 2), round(secondary, 2), _bbox_area(tuple(boxes[item["box"]].get("bbox", (0.0, 0.0, 0.0, 0.0))[:4])))
+
+        if component_provenance == "branch":
+            return sorted(candidates, key=root_sort_key)[0]["box"]
+        return sorted(candidates, key=root_sort_key)[0]["box"]
+
+    def edge_confidence(
+        provenance: str,
+        source_box: int,
+        target_box: int,
+        source_node: int,
+        target_node: int,
+        arrow_score: float,
+        routing_nodes: int,
+        component_length: float,
+    ) -> float:
+        base = {"direct": 0.80, "chain": 0.66, "branch": 0.62}[provenance]
+        source_quality = _box_label_quality(boxes[source_box])
+        target_quality = _box_label_quality(boxes[target_box])
+        if source_quality and target_quality:
+            base += 0.03 + (0.01 * min(source_quality, target_quality))
+        elif source_quality or target_quality:
+            base += 0.02
+        else:
+            base -= 0.04
+
+        source_point = nodes[source_node]
+        target_point = nodes[target_node]
+        span = max(_segment_length(source_point, target_point), 1.0)
+        straightness = min(span / max(component_length, span), 1.0)
+        base += min(0.07, max(0.0, straightness - 0.55) * 0.14)
+
+        if arrow_score > 0.0:
+            base += min(0.12, 0.025 * arrow_score + (0.015 if arrow_score >= 2.0 else 0.0))
+        if routing_nodes:
+            base -= min(0.10, 0.02 * routing_nodes)
+        if provenance == "branch" and source_quality and target_quality:
+            base += 0.01
+        return round(min(max(base, 0.55), 0.97), 2)
 
     for node_index in range(len(nodes)):
         if node_index in visited:
@@ -1541,16 +1650,25 @@ def _infer_diagram_edges(
         endpoint_nodes = [index for index in component_nodes if len(adjacency.get(index, set())) <= 1]
         if len(endpoint_nodes) < 2:
             continue
-        endpoint_payloads: list[tuple[int, int]] = []
+
+        endpoint_payloads: list[dict[str, Any]] = []
         for endpoint in endpoint_nodes:
             box_index = _find_connector_box_index(nodes[endpoint], boxes)
             if box_index is not None:
-                endpoint_payloads.append((endpoint, box_index))
+                degree = len(adjacency.get(endpoint, set()))
+                endpoint_payloads.append(
+                    {
+                        "node": endpoint,
+                        "box": box_index,
+                        "degree": degree,
+                        "routing": is_routing_box(box_index, degree),
+                    }
+                )
         if len(endpoint_payloads) < 2:
             continue
 
-        semantic_payloads = [item for item in endpoint_payloads if not is_routing_box(item[1])]
-        labeled_payloads = [item for item in semantic_payloads if boxes[item[1]].get("label")]
+        semantic_payloads = [item for item in endpoint_payloads if not item["routing"]]
+        labeled_payloads = [item for item in semantic_payloads if _box_label_quality(boxes[item["box"]]) > 0.0]
         if len(labeled_payloads) >= 2:
             effective_payloads = labeled_payloads
         elif len(semantic_payloads) >= 2:
@@ -1565,29 +1683,48 @@ def _infer_diagram_edges(
         else:
             provenance = "chain"
 
+        ordered_effective_payloads = ordered_payloads(effective_payloads)
+        payload_by_box = {item["box"]: item for item in ordered_effective_payloads}
+        component_length = sum(segment_lengths[index] for index in component_segments) if component_segments else 1.0
+
         arrow_target_box: int | None = None
         arrow_score = 0.0
-        for endpoint_node, endpoint_box in effective_payloads:
-            others = [item for item in effective_payloads if item[0] != endpoint_node]
+        for payload in ordered_effective_payloads:
+            endpoint_node = payload["node"]
+            others = [item for item in ordered_effective_payloads if item["node"] != endpoint_node]
             if not others:
                 continue
-            nearest_other = min(others, key=lambda item: _segment_length(nodes[endpoint_node], nodes[item[0]]))
-            score = endpoint_arrow_score(nodes[endpoint_node], nodes[nearest_other[0]])
+            nearest_other = min(others, key=lambda item: _segment_length(nodes[endpoint_node], nodes[item["node"]]))
+            score = endpoint_arrow_score(nodes[endpoint_node], nodes[nearest_other["node"]])
             if score > arrow_score:
                 arrow_score = score
-                arrow_target_box = endpoint_box
+                arrow_target_box = payload["box"]
+
+        routing_nodes = max(0, len(endpoint_payloads) - len(effective_payloads))
 
         if provenance == "branch":
             root_box = choose_root_index(effective_payloads, provenance)
-            if arrow_target_box is not None and len(effective_payloads) >= 2:
-                for _node, source_box in effective_payloads:
+            root_payload = payload_by_box.get(root_box)
+            if arrow_target_box is not None and len(ordered_effective_payloads) >= 2 and arrow_target_box in payload_by_box:
+                target_payload = payload_by_box[arrow_target_box]
+                for payload in ordered_effective_payloads:
+                    source_box = payload["box"]
                     if source_box == arrow_target_box:
                         continue
                     edge_key = (source_box, arrow_target_box, provenance)
                     if edge_key in seen_edges:
                         continue
                     seen_edges.add(edge_key)
-                    confidence = 0.66 + (0.12 if boxes[source_box].get("label") else 0.0) + (0.08 if arrow_score >= 2 else 0.0)
+                    confidence = edge_confidence(
+                        provenance,
+                        source_box,
+                        arrow_target_box,
+                        payload["node"],
+                        target_payload["node"],
+                        arrow_score,
+                        routing_nodes,
+                        component_length,
+                    )
                     edges.append(
                         {
                             "from_index": source_box + 1,
@@ -1596,19 +1733,29 @@ def _infer_diagram_edges(
                             "to_label": str(boxes[arrow_target_box].get("label", "") or ""),
                             "provenance": provenance,
                             "direction_hint": "arrowhead",
-                            "confidence": round(min(confidence, 0.97), 2),
-                            "routing_nodes": max(0, len(endpoint_payloads) - len(effective_payloads)),
+                            "confidence": confidence,
+                            "routing_nodes": routing_nodes,
                         }
                     )
-            else:
-                for _node, target_box in effective_payloads:
+            elif root_payload is not None:
+                for payload in ordered_effective_payloads:
+                    target_box = payload["box"]
                     if target_box == root_box:
                         continue
                     edge_key = (root_box, target_box, provenance)
                     if edge_key in seen_edges:
                         continue
                     seen_edges.add(edge_key)
-                    confidence = 0.62 + (0.08 if boxes[root_box].get("label") and boxes[target_box].get("label") else 0.0)
+                    confidence = edge_confidence(
+                        provenance,
+                        root_box,
+                        target_box,
+                        root_payload["node"],
+                        payload["node"],
+                        arrow_score,
+                        routing_nodes,
+                        component_length,
+                    )
                     edges.append(
                         {
                             "from_index": root_box + 1,
@@ -1617,14 +1764,16 @@ def _infer_diagram_edges(
                             "to_label": str(boxes[target_box].get("label", "") or ""),
                             "provenance": provenance,
                             "direction_hint": "spatial-branch",
-                            "confidence": round(min(confidence, 0.97), 2),
-                            "routing_nodes": max(0, len(endpoint_payloads) - len(effective_payloads)),
+                            "confidence": confidence,
+                            "routing_nodes": routing_nodes,
                         }
                     )
             continue
 
-        first_node, first_box = effective_payloads[0]
-        last_node, last_box = effective_payloads[-1]
+        first_payload = ordered_effective_payloads[0]
+        last_payload = ordered_effective_payloads[-1]
+        first_node, first_box = first_payload["node"], first_payload["box"]
+        last_node, last_box = last_payload["node"], last_payload["box"]
         if first_box == last_box:
             continue
         first_point = nodes[first_node]
@@ -1632,7 +1781,7 @@ def _infer_diagram_edges(
         if arrow_target_box is not None:
             if first_box == arrow_target_box:
                 first_box, last_box = last_box, first_box
-                first_point, last_point = last_point, first_point
+                first_node, last_node = last_node, first_node
             direction_hint = "arrowhead"
         elif provenance == "direct":
             direction_hint = "segment"
@@ -1641,16 +1790,23 @@ def _infer_diagram_edges(
             if abs(last_point[1] - first_point[1]) > abs(last_point[0] - first_point[0]):
                 if first_point[1] > last_point[1]:
                     first_box, last_box = last_box, first_box
+                    first_node, last_node = last_node, first_node
             elif first_point[0] > last_point[0]:
                 first_box, last_box = last_box, first_box
+                first_node, last_node = last_node, first_node
 
         first_label = str(boxes[first_box].get("label", "") or "")
         last_label = str(boxes[last_box].get("label", "") or "")
-        confidence = 0.82 if provenance == "direct" else 0.64
-        if first_label and last_label:
-            confidence += 0.08
-        if direction_hint == "arrowhead" and arrow_score >= 2:
-            confidence += 0.07
+        confidence = edge_confidence(
+            provenance,
+            first_box,
+            last_box,
+            first_node,
+            last_node,
+            arrow_score,
+            routing_nodes,
+            component_length,
+        )
         edge_key = (first_box, last_box, provenance)
         if edge_key in seen_edges:
             continue
@@ -1663,8 +1819,8 @@ def _infer_diagram_edges(
                 "to_label": last_label,
                 "provenance": provenance,
                 "direction_hint": direction_hint,
-                "confidence": round(min(confidence, 0.97), 2),
-                "routing_nodes": max(0, len(endpoint_payloads) - len(effective_payloads)),
+                "confidence": confidence,
+                "routing_nodes": routing_nodes,
             }
         )
 
@@ -1858,7 +2014,7 @@ def _extract_pymupdf_diagram_primitives(page: Any, page_dict: dict[str, Any]) ->
         )
 
     unlabeled = sum(1 for box in boxes if not box["label"])
-    arrow_segments = [segment for segment in line_segments if _segment_length(segment[0], segment[1]) <= 22.0]
+    arrow_segments = [segment for segment in line_segments if _segment_length(segment[0], segment[1]) <= 28.0]
     edges = _infer_diagram_edges(boxes, connector_segments, arrow_segments)
     return {
         "boxes": boxes[:12],
@@ -1884,6 +2040,10 @@ def _merge_ocr_labels_into_diagram(diagram: dict[str, Any], ocr_payload: dict[st
     page_height = float(page.rect.height or 1.0)
     scale_x = page_width / image_width
     scale_y = page_height / image_height
+    label_retry = bool(isinstance(ocr_payload.get("strategy"), dict) and ocr_payload["strategy"].get("label_retry"))
+    strict_floor = 45.0 if label_retry else 55.0
+    fallback_floor = 18.0 if label_retry else 25.0
+    fallback_limit = 32 if label_retry else 24
 
     for box in boxes:
         if box.get("label"):
@@ -1911,9 +2071,14 @@ def _merge_ocr_labels_into_diagram(diagram: dict[str, Any], ocr_payload: dict[st
             if not _bbox_contains(rect, word_bbox, tolerance=8.0):
                 continue
             word_order = (word_bbox[1], word_bbox[0])
-            if confidence >= 55.0:
+            if confidence >= strict_floor:
                 strict_labels.append((word_order[0], word_order[1], confidence, text))
-            elif confidence >= 25.0 and len(text) <= 24:
+            elif confidence >= fallback_floor and len(text) <= fallback_limit and _ocr_word_is_label_like(
+                text,
+                confidence,
+                layout_hint="diagram" if label_retry else "text",
+                label_focus=label_retry,
+            ):
                 fallback_labels.append((word_order[0], word_order[1], confidence, text))
         strict_labels.sort(key=lambda item: (round(item[0], 1), round(item[1], 1)))
         labels = [text for _y, _x, _confidence, text in strict_labels]
@@ -2160,6 +2325,8 @@ def _extract_pdf_page_ocr_payload(
     if cached:
         cached["status"] = "cache-hit"
         return cached
+    page_dict = page.get_text("dict", sort=True)
+    diagram = _extract_pymupdf_diagram_primitives(page, page_dict)
     cache_path = _cache_file_path(cache_dir, "ocr", cache_key)
     with _cache_lock(cache_path):
         if cache_path and cache_path.exists():
@@ -2170,7 +2337,17 @@ def _extract_pdf_page_ocr_payload(
         raster = _get_cached_page_raster(page, source_path, document, page_index, dpi, cache_dir, cache_report)
         if not raster:
             return {"text": "", "overlay": "", "status": "ocr-failed", "confidence_summary": {}}
-        payload = _extract_ocr_from_raster((0, base64.b64decode(raster["data"]), force, dpi, profile["key"]))[1]
+        payload = _extract_ocr_from_raster(
+            (
+                0,
+                base64.b64decode(raster["data"]),
+                force,
+                dpi,
+                profile["key"],
+                diagram,
+                (float(page.rect.width or 0.0), float(page.rect.height or 0.0)),
+            )
+        )[1]
         payload["status"] = "ocr-force" if force else "ocr-auto"
         _save_ocr_cache(cache_dir, cache_key, cache_meta, payload, cache_report)
         return payload
@@ -2427,20 +2604,22 @@ def _build_ocr_profile(layout_hint: str, *, force: bool) -> dict[str, Any]:
     if normalized == "diagram":
         return {
             "key": f"{'force' if force else 'auto'}-diagram",
-            "psm_candidates": [11, 12, 6],
-            "threshold": 170,
+            "psm_candidates": [11, 6, 7],
+            "threshold": 166,
             "grayscale": True,
-            "variant_policy": "full-diagram",
-            "word_confidence_floor": 25,
+            "variant_policy": "diagram-label",
+            "word_confidence_floor": 22,
+            "label_retry": True,
         }
     if normalized == "mixed":
         return {
             "key": f"{'force' if force else 'auto'}-mixed",
-            "psm_candidates": [6, 11],
-            "threshold": 176,
+            "psm_candidates": [6, 11, 7],
+            "threshold": 172,
             "grayscale": True,
-            "variant_policy": "balanced",
-            "word_confidence_floor": 30,
+            "variant_policy": "diagram-label",
+            "word_confidence_floor": 24,
+            "label_retry": True,
         }
     return {
         "key": f"{'force' if force else 'auto'}-text",
@@ -2465,6 +2644,17 @@ def _build_ocr_profile_variants(profile: dict[str, Any]) -> list[dict[str, Any]]
             {**profile, "variant": "base"},
             {**profile, "variant": "strong", "threshold": min(base_threshold + 12, 235)},
         ]
+    elif policy == "diagram-label":
+        variants = [
+            {**profile, "variant": "base"},
+            {**profile, "variant": "soft", "threshold": max(base_threshold - 22, 110)},
+            {
+                **profile,
+                "variant": "label",
+                "threshold": max(base_threshold - 34, 96),
+                "word_confidence_floor": min(int(profile.get("word_confidence_floor", 40) or 40), 18),
+            },
+        ]
     else:
         variants = [
             {**profile, "variant": "base"},
@@ -2486,9 +2676,9 @@ def _should_stop_ocr_trials(summary: dict[str, Any], score: float) -> str | None
     avg = float(summary.get("avg", 0.0) or 0.0)
     low_ratio = float(summary.get("low_confidence_ratio", 1.0) or 0.0)
     words = int(summary.get("words", 0) or 0)
-    if avg >= 95.0 and low_ratio <= 0.02 and words >= 2:
+    if avg >= 96.0 and low_ratio <= 0.015 and words >= 2:
         return "excellent-confidence"
-    if avg >= 92.0 and low_ratio <= 0.0 and words >= 5 and score >= 92.1:
+    if avg >= 93.0 and low_ratio <= 0.0 and words >= 5 and score >= 92.5:
         return "high-confidence-complete"
     return None
 
@@ -2510,26 +2700,76 @@ def _should_expand_ocr_variants(
         return [{**profile, "variant": "strong", "threshold": min(threshold + 12, 235)}]
     if policy == "focused-table" and "soft" not in tried and (avg < 80.0 or low_ratio >= 0.14):
         return [{**profile, "variant": "soft", "threshold": max(threshold - 18, 120)}]
+    if policy == "diagram-label":
+        if "label" not in tried and (avg < 86.0 or low_ratio >= 0.1 or words <= 6):
+            return [
+                {
+                    **profile,
+                    "variant": "label",
+                    "threshold": max(threshold - 30, 96),
+                    "word_confidence_floor": min(int(profile.get("word_confidence_floor", 40) or 40), 18),
+                }
+            ]
+        if "soft" not in tried and avg < 79.0 and low_ratio >= 0.06:
+            return [{**profile, "variant": "soft", "threshold": max(threshold - 22, 110)}]
     return []
 
 
-def _extract_ocr_words(ocr_data: dict[str, list[Any]], *, min_confidence: float = 40.0) -> list[dict[str, Any]]:
+def _normalize_ocr_word_text(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", text or "").strip()
+    cleaned = cleaned.strip("·•:;,_-–—/\\|[]{}()<>")
+    return cleaned.strip()
+
+
+def _ocr_word_is_label_like(text: str, confidence: float, *, layout_hint: str, label_focus: bool) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return False
+    if not re.search(r"[0-9A-Za-z\uac00-\ud7a3]", compact):
+        return False
+    if re.fullmatch(r"[_\W]+", compact):
+        return False
+    if len(compact) <= 1:
+        return confidence >= (18.0 if label_focus or layout_hint in {"diagram", "mixed"} else 28.0)
+    if len(compact) <= 3:
+        return confidence >= (14.0 if label_focus or layout_hint in {"diagram", "mixed"} else 24.0)
+    if len(compact) <= 6 and layout_hint in {"diagram", "mixed"}:
+        return confidence >= 12.0 if label_focus else confidence >= 20.0
+    return True
+
+
+def _extract_ocr_words(
+    ocr_data: dict[str, list[Any]],
+    *,
+    min_confidence: float = 40.0,
+    layout_hint: str = "text",
+    label_focus: bool = False,
+) -> list[dict[str, Any]]:
     words: list[dict[str, Any]] = []
     total = len(ocr_data.get("text", []))
+    effective_floor = float(min_confidence)
+    if layout_hint in {"diagram", "mixed"}:
+        effective_floor = min(effective_floor, 28.0)
+    if label_focus:
+        effective_floor = min(effective_floor, 18.0)
     for index in range(total):
-        text = (ocr_data.get("text", [""] * total)[index] or "").strip()
+        text = _normalize_ocr_word_text(str(ocr_data.get("text", [""] * total)[index] or ""))
         confidence = ocr_data.get("conf", ["-1"] * total)[index]
         try:
             score = float(confidence)
         except (TypeError, ValueError):
             score = -1.0
-        if not text or score < min_confidence:
+        if not text:
+            continue
+        if score < effective_floor and not _ocr_word_is_label_like(text, score, layout_hint=layout_hint, label_focus=label_focus):
             continue
         left = int(ocr_data.get("left", [0] * total)[index] or 0)
         top = int(ocr_data.get("top", [0] * total)[index] or 0)
         width = int(ocr_data.get("width", [0] * total)[index] or 0)
         height = int(ocr_data.get("height", [0] * total)[index] or 0)
         if width <= 0 or height <= 0:
+            continue
+        if len(re.sub(r"\s+", "", text)) <= 1 and score < 12.0 and not label_focus:
             continue
         words.append(
             {
@@ -2569,7 +2809,7 @@ def _build_structured_ocr_text(
         return ""
 
     median_height = sorted(heights)[len(heights) // 2] if heights else 12.0
-    line_tolerance = max(10.0, median_height * 0.8)
+    line_tolerance = max(8.0, median_height * (0.65 if layout_hint in {"diagram", "mixed"} else 0.8))
     prepared.sort(key=lambda item: ((item["bbox"][1] + item["bbox"][3]) / 2, item["bbox"][0]))
 
     lines: list[dict[str, Any]] = []
@@ -2594,7 +2834,8 @@ def _build_structured_ocr_text(
         for word in line_words[1:]:
             previous = segments[-1][-1]
             gap = float(word["bbox"][0]) - float(previous["bbox"][2])
-            if gap > max(median_height * 2.1, image_width * 0.045):
+            gap_limit = max(median_height * (1.8 if layout_hint in {"diagram", "mixed"} else 2.1), image_width * (0.035 if layout_hint in {"diagram", "mixed"} else 0.045))
+            if gap > gap_limit:
                 segments.append([word])
             else:
                 segments[-1].append(word)
@@ -2654,6 +2895,140 @@ def _build_structured_ocr_text(
     return _clean_pdf_text("\n".join(parts))
 
 
+def _extract_label_retry_words_from_image(
+    image: Any,
+    diagram: dict[str, Any],
+    profile: dict[str, Any],
+    *,
+    page_width: float,
+    page_height: float,
+    layout_hint: str,
+) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
+    if layout_hint not in {"diagram", "mixed"}:
+        return [], [], {}
+    boxes = [box for box in diagram.get("boxes", []) if isinstance(box, dict) and not str(box.get("label", "")).strip()]
+    if not boxes:
+        return [], [], {}
+
+    try:
+        from PIL import Image
+        import pytesseract
+    except ImportError:
+        return [], [], {}
+
+    image_width, image_height = image.size
+    if image_width <= 0 or image_height <= 0 or page_width <= 0 or page_height <= 0:
+        return [], [], {}
+
+    scale_x = image_width / page_width
+    scale_y = image_height / page_height
+    retry_words: list[dict[str, Any]] = []
+    retry_texts: list[str] = []
+    attempted = 0
+
+    candidate_boxes = sorted(
+        boxes,
+        key=lambda box: (
+            float(box.get("bbox", [0.0, 0.0, 0.0, 0.0])[2]) - float(box.get("bbox", [0.0, 0.0, 0.0, 0.0])[0]),
+            float(box.get("bbox", [0.0, 0.0, 0.0, 0.0])[3]) - float(box.get("bbox", [0.0, 0.0, 0.0, 0.0])[1]),
+        ),
+    )[:8]
+    for box in candidate_boxes:
+        bbox = box.get("bbox", [])
+        if not isinstance(bbox, list) or len(bbox) < 4:
+            continue
+        x0, y0, x1, y1 = [float(value) for value in bbox[:4]]
+        if x1 <= x0 or y1 <= y0:
+            continue
+        attempted += 1
+        pad_x = max(10.0, (x1 - x0) * 0.18)
+        pad_y = max(8.0, (y1 - y0) * 0.22)
+        crop = (
+            max(0, int((x0 - pad_x) * scale_x)),
+            max(0, int((y0 - pad_y) * scale_y)),
+            min(image_width, int((x1 + pad_x) * scale_x)),
+            min(image_height, int((y1 + pad_y) * scale_y)),
+        )
+        if crop[2] - crop[0] < 10 or crop[3] - crop[1] < 10:
+            continue
+        crop_image = image.crop(crop)
+        crop_profile = {
+            **profile,
+            "variant": "label-retry",
+            "threshold": max(int(profile.get("threshold", 0) or 0) - 36, 92),
+            "word_confidence_floor": min(int(profile.get("word_confidence_floor", 40) or 40), 16),
+        }
+        processed = _preprocess_ocr_image(crop_image, crop_profile)
+        crop_data = pytesseract.image_to_data(
+            processed,
+            lang="kor+eng",
+            config="--psm 6",
+            output_type=pytesseract.Output.DICT,
+        )
+        crop_words = _extract_ocr_words(
+            crop_data,
+            min_confidence=float(crop_profile.get("word_confidence_floor", 16) or 16),
+            layout_hint=layout_hint,
+            label_focus=True,
+        )
+        if not crop_words:
+            continue
+        offset_x, offset_y = crop[0], crop[1]
+        for word in crop_words:
+            bbox_word = word.get("bbox", [])
+            if not isinstance(bbox_word, list) or len(bbox_word) != 4:
+                continue
+            word["bbox"] = [
+                int(bbox_word[0] + offset_x),
+                int(bbox_word[1] + offset_y),
+                int(bbox_word[2] + offset_x),
+                int(bbox_word[3] + offset_y),
+            ]
+        retry_words.extend(crop_words)
+        retry_texts.extend(word["text"] for word in crop_words if word.get("text"))
+
+    if not retry_words:
+        return [], [], {"attempted_boxes": attempted, "recovered_boxes": 0}
+    return retry_words, retry_texts, {"attempted_boxes": attempted, "recovered_boxes": len(retry_words)}
+
+
+def _merge_ocr_word_lists(
+    base_words: list[dict[str, Any]],
+    extra_words: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged = [dict(word) for word in base_words if isinstance(word, dict)]
+    for word in extra_words:
+        if not isinstance(word, dict):
+            continue
+        text = _normalize_ocr_word_text(str(word.get("text", "")))
+        bbox = word.get("bbox", [])
+        if not text or not isinstance(bbox, list) or len(bbox) != 4:
+            continue
+        candidate = tuple(float(value) for value in bbox[:4])
+        duplicate = False
+        for existing in merged:
+            existing_text = _normalize_ocr_word_text(str(existing.get("text", "")))
+            existing_bbox = existing.get("bbox", [])
+            if not existing_text or not isinstance(existing_bbox, list) or len(existing_bbox) != 4:
+                continue
+            if existing_text != text:
+                continue
+            existing_rect = tuple(float(value) for value in existing_bbox[:4])
+            if _bbox_overlaps(existing_rect, candidate):
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        merged.append(
+            {
+                "text": text,
+                "confidence": float(word.get("confidence", 0.0) or 0.0),
+                "bbox": [int(candidate[0]), int(candidate[1]), int(candidate[2]), int(candidate[3])],
+            }
+        )
+    return merged
+
+
 def _preprocess_ocr_image(image: Any, profile: dict[str, Any]) -> Any:
     from PIL import ImageOps
 
@@ -2665,8 +3040,10 @@ def _preprocess_ocr_image(image: Any, profile: dict[str, Any]) -> Any:
     return processed.convert("RGB")
 
 
-def _extract_ocr_from_raster(task: tuple[int, bytes, bool, int, str]) -> tuple[int, dict[str, str]]:
-    page_index, image_bytes, force, _dpi, profile_key = task
+def _extract_ocr_from_raster(
+    task: tuple[int, bytes, bool, int, str, dict[str, Any], tuple[float, float]],
+) -> tuple[int, dict[str, str]]:
+    page_index, image_bytes, force, _dpi, profile_key, diagram, page_size = task
     if not shutil.which("tesseract"):
         return page_index, {"text": "", "overlay": "", "confidence_summary": {}}
     try:
@@ -2717,6 +3094,7 @@ def _extract_ocr_from_raster(task: tuple[int, bytes, bool, int, str]) -> tuple[i
                     words = _extract_ocr_words(
                         data,
                         min_confidence=float(profile.get("word_confidence_floor", 40.0) or 40.0),
+                        layout_hint=layout_hint,
                     )
                     structured_text = _build_structured_ocr_text(
                         words,
@@ -2754,6 +3132,47 @@ def _extract_ocr_from_raster(task: tuple[int, bytes, bool, int, str]) -> tuple[i
             stop_reason = "exhausted-candidates"
         if best_payload is None:
             return page_index, {"text": "", "overlay": "", "confidence_summary": {}, "profile": profile["key"], "strategy": {}}
+        label_retry_info: dict[str, Any] = {}
+        if (
+            isinstance(diagram, dict)
+            and layout_hint in {"diagram", "mixed"}
+            and page_size[0] > 0
+            and page_size[1] > 0
+        ):
+            retry_words, retry_texts, label_retry_info = _extract_label_retry_words_from_image(
+                image,
+                diagram,
+                profile,
+                page_width=float(page_size[0]),
+                page_height=float(page_size[1]),
+                layout_hint=layout_hint,
+            )
+            if retry_words:
+                merged_words = _merge_ocr_word_lists(best_payload.get("words", []), retry_words)
+                merged_text = _build_structured_ocr_text(
+                    merged_words,
+                    image_width=width,
+                    image_height=height,
+                    layout_hint=layout_hint,
+                )
+                retry_text = _clean_pdf_text("\n".join(dict.fromkeys(text for text in retry_texts if text)))
+                if merged_words:
+                    best_payload["words"] = merged_words
+                if merged_text:
+                    if not best_payload.get("text"):
+                        best_payload["text"] = merged_text
+                    elif len(merged_text) > len(str(best_payload.get("text", ""))) * 0.72:
+                        best_payload["text"] = _clean_pdf_text(f"{best_payload['text']}\n{merged_text}")
+                elif retry_text:
+                    best_payload["text"] = _clean_pdf_text(
+                        f"{best_payload.get('text', '')}\n{retry_text}" if best_payload.get("text") else retry_text
+                    )
+                label_retry_info["retry_words"] = len(retry_words)
+                label_retry_info["merged_words"] = len(merged_words)
+                if retry_text:
+                    label_retry_info["recovered_text"] = retry_text
+                if isinstance(best_payload.get("strategy"), dict):
+                    best_payload["strategy"]["label_retry"] = label_retry_info
         if isinstance(best_payload.get("strategy"), dict):
             best_payload["strategy"]["trials"] = trials
             best_payload["strategy"]["stop_reason"] = stop_reason or ""

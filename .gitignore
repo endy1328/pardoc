@@ -80,6 +80,7 @@ Thumbs.db
 *.log
 *.tmp
 *.bak
+.tmp*/
 temp/
 tmp/
 *.Zone.Identifier

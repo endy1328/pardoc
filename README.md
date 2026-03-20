@@ -215,6 +215,12 @@ pardoc report.pdf --pdf-mode hybrid --debug-overlays --format html
 
 ## 테스트
 
+권장 정책:
+
+- `fast`: 캐시와 핵심 유틸리티 중심의 빠른 단위 테스트
+- `pr`: `fast` + 샘플 PDF snapshot regression
+- `nightly`: `pr` + `pdf_sample` corpus smoke regression
+
 빠른 단위 테스트:
 
 ```bash
@@ -233,27 +239,31 @@ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_pdf_regre
 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_pdf_corpus_regression.py' -v
 ```
 
+현재 corpus regression은 기존 `pdf_sample`만으로 text / diagram / mixed-table / known-unlabeled-diagram 대표군을 고정합니다. `AULA F87Pro 퀵 가이드.pdf`, `PMBOK 핵심요약(1부~5부).pdf`, `profile_form.pdf`, `teugijeomi onda - rei keojeuwail.pdf`는 OCR retry 경로를 수동으로 다시 보는 review list에 따로 올려 두는 편이 안전합니다.
+
 suite helper script:
 
 ```bash
 scripts/run_test_suites.sh fast
+scripts/run_test_suites.sh pr
 scripts/run_test_suites.sh sample
 scripts/run_test_suites.sh corpus
+scripts/run_test_suites.sh nightly
 scripts/run_test_suites.sh all
 ```
 
 GitHub Actions workflow:
 
 - `.github/workflows/tests.yml`
-- `fast`: push / PR
-- `sample_pdf`: push / PR
-- `corpus_pdf`: nightly or manual dispatch
+- `push` / `pull_request`: `scripts/run_test_suites.sh pr`
+- `schedule` / `workflow_dispatch`: `scripts/run_test_suites.sh nightly`
 
 snapshot update workflow:
 
-1. heuristic or parser change 후 관련 테스트를 실행합니다.
+1. heuristic, parser, OCR, diagram 관련 변경 후 `scripts/run_test_suites.sh pr`를 먼저 실행합니다.
 2. 의도된 출력 변화라면 `tests/snapshots/*`를 새 결과로 갱신합니다.
-3. `test_pdf_regression.py`, `test_pdf_corpus_regression.py`를 다시 실행해 snapshot drift가 없는지 확인합니다.
+3. `tests/snapshots/pdf_sample_family_matrix.json`처럼 corpus family snapshot이나 review list가 영향을 받는 경우 `scripts/run_test_suites.sh nightly`까지 다시 실행해 drift가 없는지 확인합니다.
+4. 변경 이유가 문서화가 필요하면 `TODO.md`의 완료 항목과 README 테스트 정책을 함께 갱신합니다.
 
 전체 테스트:
 

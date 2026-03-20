@@ -41,7 +41,7 @@
     "diagram": {
       "boxes": 12,
       "connectors": 20,
-      "edges": 5
+      "edges": 6
     },
     "ocr": {
       "status": "native-text",

@@ -137,6 +137,35 @@ class ArrowDiagramPage(DiagramPage):
         ]
 
 
+class LongWingArrowDiagramPage(DiagramPage):
+    class RectPage:
+        width = 420
+        height = 120
+
+    rect = RectPage()
+
+    def get_drawings(self):
+        class Rect:
+            def __init__(self, x0, y0, x1, y1):
+                self.x0 = x0
+                self.y0 = y0
+                self.x1 = x1
+                self.y1 = y1
+
+        class Point:
+            def __init__(self, x, y):
+                self.x = x
+                self.y = y
+
+        return [
+            {"items": [("re", Rect(0, 20, 150, 100))]},
+            {"items": [("re", Rect(270, 20, 420, 100))]},
+            {"items": [("l", Point(150, 60), Point(270, 60))]},
+            {"items": [("l", Point(270, 60), Point(248, 48))]},
+            {"items": [("l", Point(270, 60), Point(248, 72))]},
+        ]
+
+
 class LargeRectDiagramPage(DiagramPage):
     def get_drawings(self):
         class Rect:
@@ -384,6 +413,60 @@ class CacheTests(unittest.TestCase):
         self.assertGreaterEqual(diagram["edges"][0]["confidence"], 0.9)
         self.assertEqual(diagram["edges"][0]["routing_nodes"], 0)
 
+    def test_diagram_edge_inference_detects_long_wing_arrowheads(self) -> None:
+        page_dict = {
+            "blocks": [
+                {
+                    "type": 0,
+                    "bbox": (10, 30, 120, 70),
+                    "lines": [{"spans": [{"text": "Alpha", "bbox": (10, 30, 70, 45), "size": 12}]}],
+                },
+                {
+                    "type": 0,
+                    "bbox": (300, 30, 390, 70),
+                    "lines": [{"spans": [{"text": "Omega", "bbox": (300, 30, 360, 45), "size": 12}]}],
+                },
+            ]
+        }
+
+        diagram = converters._extract_pymupdf_diagram_primitives(LongWingArrowDiagramPage(), page_dict)
+        self.assertEqual(len(diagram["edges"]), 1)
+        self.assertEqual(diagram["edges"][0]["from_label"], "Alpha")
+        self.assertEqual(diagram["edges"][0]["to_label"], "Omega")
+        self.assertEqual(diagram["edges"][0]["direction_hint"], "arrowhead")
+        self.assertGreaterEqual(diagram["edges"][0]["confidence"], 0.9)
+
+    def test_find_connector_box_index_prefers_labeled_semantic_boxes(self) -> None:
+        boxes = [
+            {"bbox": [92.0, 42.0, 108.0, 58.0], "label": "", "label_source": ""},
+            {"bbox": [70.0, 20.0, 130.0, 80.0], "label": "Semantic", "label_source": "native"},
+        ]
+
+        self.assertEqual(converters._find_connector_box_index((100.0, 50.0), boxes), 1)
+
+    def test_diagram_branch_root_follows_horizontal_axis(self) -> None:
+        boxes = [
+            {"bbox": [0.0, 40.0, 40.0, 60.0], "label": "Source", "label_source": "native"},
+            {"bbox": [180.0, 10.0, 220.0, 30.0], "label": "Upper", "label_source": "native"},
+            {"bbox": [180.0, 70.0, 220.0, 90.0], "label": "Lower", "label_source": "native"},
+            {"bbox": [380.0, 40.0, 420.0, 60.0], "label": "Target", "label_source": "native"},
+        ]
+        connector_segments = [
+            ((40.0, 50.0), (200.0, 50.0)),
+            ((200.0, 50.0), (200.0, 20.0)),
+            ((200.0, 50.0), (200.0, 80.0)),
+            ((200.0, 50.0), (380.0, 50.0)),
+        ]
+
+        edges = converters._infer_diagram_edges(boxes, connector_segments, [])
+        self.assertEqual(len(edges), 3)
+        self.assertEqual(
+            {(edge["from_label"], edge["to_label"]) for edge in edges},
+            {("Source", "Upper"), ("Source", "Lower"), ("Source", "Target")},
+        )
+        self.assertTrue(all(edge["provenance"] == "branch" for edge in edges))
+        self.assertTrue(all(edge["direction_hint"] == "spatial-branch" for edge in edges))
+
     def test_diagram_labels_can_be_backfilled_from_ocr_words(self) -> None:
         diagram = {
             "boxes": [
@@ -530,12 +613,12 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(table_profile["psm_candidates"][0], 6)
         self.assertTrue(table_profile["key"].startswith("force-table"))
         self.assertEqual(text_profile["variant_policy"], "fast-text")
-        self.assertEqual(diagram_profile["variant_policy"], "full-diagram")
+        self.assertEqual(diagram_profile["variant_policy"], "diagram-label")
         self.assertEqual(table_profile["variant_policy"], "focused-table")
-        self.assertEqual(diagram_profile["word_confidence_floor"], 25)
+        self.assertEqual(diagram_profile["word_confidence_floor"], 22)
         variants = converters._build_ocr_profile_variants(diagram_profile)
-        self.assertEqual([item["variant"] for item in variants], ["base", "soft", "strong"])
-        self.assertGreater(variants[2]["threshold"], variants[0]["threshold"])
+        self.assertEqual([item["variant"] for item in variants], ["base", "soft", "label"])
+        self.assertLess(variants[2]["threshold"], variants[0]["threshold"])
         text_variants = converters._build_ocr_profile_variants(text_profile)
         self.assertEqual([item["variant"] for item in text_variants], ["base", "soft"])
 
@@ -555,8 +638,8 @@ class CacheTests(unittest.TestCase):
 
     def test_ocr_trial_early_stop_rule_detects_excellent_candidate(self) -> None:
         reason = converters._should_stop_ocr_trials(
-            {"avg": 95.2, "low_confidence_ratio": 0.0, "words": 3},
-            95.25,
+            {"avg": 96.1, "low_confidence_ratio": 0.0, "words": 3},
+            96.15,
         )
         self.assertEqual(reason, "excellent-confidence")
 
@@ -584,7 +667,7 @@ class CacheTests(unittest.TestCase):
     def test_extract_ocr_words_respects_min_confidence(self) -> None:
         words = converters._extract_ocr_words(
             {
-                "text": ["keep", "drop"],
+                "text": ["keep", "..."],
                 "conf": ["28", "22"],
                 "left": [0, 0],
                 "top": [0, 0],

@@ -2,11 +2,12 @@
 > Diagram hints | boxes: 1 | connectors: 0 | edges: 0 | unlabeled boxes: 0
 ## Page 2
 ## Page 3
-> Diagram hints | boxes: 12 | connectors: 20 | edges: 5 | unlabeled boxes: 11
-- Flow: 지식영역 프로세스 -> Box 18 (direct, conf 0.82)
-- Flow: Box 5 -> Box 19 (direct, conf 0.82)
-- Flow: Box 3 -> Box 7 (direct, conf 0.82)
-- Flow: 4. 통합관리 -> Box 7 (direct, conf 0.82)
+> Diagram hints | boxes: 12 | connectors: 20 | edges: 6 | unlabeled boxes: 11
+- Flow: 지식영역 프로세스 -> Box 18 (direct, conf 0.88)
+- Flow: 프로젝트관리프로세스그룹 -> Box 19 (direct, conf 0.88)
+- Flow: 지식영역 프로세스 -> 프로젝트관리프로세스그룹 (direct, conf 0.9)
+- Flow: 4. 통합관리 -> Box 7 (direct, conf 0.88)
+- Flow: 11. 리스크관리 -> Box 17 (direct, conf 0.88)
 - Flow: Box 16 -> Box 17 (direct, conf 0.82)
 ## Page 4
 ## Page 5

@@ -1,0 +1,86 @@
+[
+  {
+    "file": "AgilePG_KOR-UL.pdf",
+    "family": "text",
+    "layout": "text",
+    "dominant_signal": "text",
+    "table_count": 0,
+    "diagram": {
+      "boxes": 0,
+      "connectors": 1,
+      "edges": 0,
+      "unlabeled_boxes": 0
+    },
+    "ocr_status": "native-text"
+  },
+  {
+    "file": "12장 조달관리.pdf",
+    "family": "diagram",
+    "layout": "diagram",
+    "dominant_signal": "diagram",
+    "table_count": 0,
+    "diagram": {
+      "boxes": 1,
+      "connectors": 0,
+      "edges": 0,
+      "unlabeled_boxes": 0
+    },
+    "ocr_status": "native-text"
+  },
+  {
+    "file": "lecture-07-refactoring-to-microservices.pdf",
+    "family": "mixed-text-diagram",
+    "layout": "mixed",
+    "dominant_signal": "text+diagram",
+    "table_count": 0,
+    "diagram": {
+      "boxes": 0,
+      "connectors": 0,
+      "edges": 0,
+      "unlabeled_boxes": 0
+    },
+    "ocr_status": "native-text"
+  },
+  {
+    "file": "250507_P-DX AI미팅_순번 2. BPED P&ID.pdf",
+    "family": "mixed-table",
+    "layout": "mixed",
+    "dominant_signal": "text+table",
+    "table_count": 4,
+    "diagram": {
+      "boxes": 0,
+      "connectors": 158,
+      "edges": 0,
+      "unlabeled_boxes": 0
+    },
+    "ocr_status": "native-text"
+  },
+  {
+    "file": "AWS101_Services+0517.pdf",
+    "family": "known-unlabeled-diagram",
+    "layout": "diagram",
+    "dominant_signal": "diagram",
+    "table_count": 0,
+    "diagram": {
+      "boxes": 1,
+      "connectors": 1,
+      "edges": 0,
+      "unlabeled_boxes": 1
+    },
+    "ocr_status": "native-text"
+  },
+  {
+    "file": "en_DxO_Optics_Pro_v5_Visual_Guide.pdf",
+    "family": "diagram",
+    "layout": "diagram",
+    "dominant_signal": "diagram",
+    "table_count": 0,
+    "diagram": {
+      "boxes": 0,
+      "connectors": 6,
+      "edges": 0,
+      "unlabeled_boxes": 0
+    },
+    "ocr_status": "native-text"
+  }
+]
